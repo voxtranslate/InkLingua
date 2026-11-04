@@ -31,6 +31,19 @@ def run_single(cfg: Config, base_units: Optional[Sequence[str]] = None) -> Optio
     data = HandwritingDataModule(cfg, base_units=base_units).prepare()
     if not cfg.llm.source_language:
         cfg.llm.source_language = data.primary_language
+    if cfg.train.auto_schedule and cfg.run.do_train:
+        import json as _json
+        import numpy as _np
+        from .schedule import apply_budget, budget, complexity_factor
+        lines = [int((data.train_ds.domain == d).sum()) for d in range(len(data.specs))]
+        b = budget(len(data.train_ds), complexity_factor(data.specs, lines), cfg.data.batch_size)
+        b["complexity_factor"] = complexity_factor(data.specs, lines)
+        apply_budget(cfg, b)
+        cfg.save()
+        with open(os.path.join(cfg.run_dir, "schedule.json"), "w") as f:
+            _json.dump(b, f, indent=2)
+        LOG.info("[SCHEDULE] %d training lines, complexity %.2f -> %d epochs (%d steps/epoch, budget %d steps), patience %d, FRAG warm-up %d",
+                 len(data.train_ds), b["complexity_factor"], b["epochs"], b["steps_per_epoch"], b["budget_steps"], b["patience"], b["frag_warmup"])
     write_protocol(cfg, data)
     llm_device = resolve_llm_device(cfg.llm.device, device)
     LOG.info("recogniser on %s, LLM on %s", device, llm_device)
@@ -40,6 +53,9 @@ def run_single(cfg: Config, base_units: Optional[Sequence[str]] = None) -> Optio
     if cfg.run.do_train:
         trainer = Trainer(cfg, data, model, llm, device)
         trainer.fit()
+        if trainer.interrupted:
+            LOG.warning("training interrupted by the time budget at epoch %d: resumable, evaluation postponed", trainer.completed_epochs)
+            return {"interrupted": True, "completed_epochs": trainer.completed_epochs}
         best = trainer.best_path if os.path.exists(trainer.best_path) else None
     if cfg.run.do_infer:
         infer = Inferencer(cfg, data, llm, device)

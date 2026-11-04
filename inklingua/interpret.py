@@ -381,7 +381,7 @@ class InterpretMixin:
             o = self.model(x.to(self.device), torch.tensor(widths, device=self.device))
             lp, ln = o["log_probs"].cpu().numpy(), o["out_lens"].cpu().tolist()
             for k, (a, b) in enumerate(chunk):
-                ref = ds.oracle[a] + sep + ds.oracle[b]
+                ref = ds.oracle[a] + ("" if ds.domain_specs[int(ds.domain[a])].script in ("Han",) else sep) + ds.oracle[b]
                 hyp = codec.decode_ids(greedy_decode(lp[k, :ln[k]])[0])
                 ed_cat.append(edit_distance(ref, hyp))
                 ed_sep.append(R["ed"][pos[a]] + R["ed"][pos[b]])

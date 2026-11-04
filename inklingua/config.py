@@ -40,6 +40,7 @@ class DatasetSpec:
     local_dir: Optional[str] = None            # folder with train/validation/test .parquet (takes precedence over the Hub)
     language: str = "en"                       # ISO code of the WRITTEN language (prompts, LM scoring, per-domain tables)
     script: str = "Latin"                      # "Latin" | "Arabic" | "Han" | "Cyrillic" | "Devanagari" | ...
+    era: str = "modern"                        # "modern" | "historical" (archival hands, abbreviations): enters the training-budget rule
     rtl: bool = False                          # right-to-left script: transcriptions are stored in LOGICAL order and are converted to
                                                # visual order (left -> right as the image is read) for training; outputs are converted back
     detokenize: bool = False                   # transcriptions are IAM-tokenised ("house , and"): re-attach punctuation for the LLM
@@ -84,6 +85,7 @@ class RunConfig:
 @dataclass
 class DataConfig:
     source: str = "hf"                         # "hf" (download) | "local" (parquet folder, see local_dir) | "synthetic" (smoke test only)
+    reader: str = "parquet"                    # "parquet" (pyarrow, parquet files only, no second Arrow copy on disk) | "datasets" (HF datasets library)
     sources: Tuple[str, ...] = ("iam",)        # registry keys (inklingua.datasets_registry.DATASETS); several = multi-corpus training
     custom_sources: Tuple[DatasetSpec, ...] = ()   # specs that are not in the registry
     hf_cache_dir: Optional[str] = None         # default: <work_dir>/data
@@ -113,6 +115,12 @@ class DataConfig:
                                                # rest (`val_sel`) selects the checkpoint.  0 or 1 = no split (validation does both jobs)
     val_block: int = 20                        # consecutive validation lines per block (a form / writer proxy: lines are stored form by form)
     domain_balance: float = 0.0                # multi-corpus: 0 = lines sampled in proportion to corpus size; 1 = every corpus equally often
+    subset_seed: int = 20261104                # seed of every line cap (DatasetSpec.max_lines, limit_*): FIXED across runs, so that all variants and
+                                               # seeds see the same capped pool (the run seed only decides which lines are labeled)
+    cap_block: int = 20                        # caps keep whole blocks of this many consecutive lines (form / page structure survives the cap)
+    line_cache_dir: Optional[str] = None       # on-disk cache of the preprocessed lines, shared by all runs of a corpus (None = off)
+    decontaminate: bool = False                # remove train lines whose image also occurs in validation / test, and validation lines that occur in
+                                               # test (counted in provenance.json); False = such overlap is an error (strict_checks)
     synthetic_sizes: Tuple[int, int, int] = (600, 120, 120)
     synthetic_words: Tuple[int, int] = (3, 6)  # words per synthetic line (offline smoke tests only)
 
@@ -273,6 +281,9 @@ class TrainConfig:
     init_from: str = ""                        # path of an InkLingua checkpoint (best.pt / last.pt / adapted.pt); "" = train from scratch
     init_lr_scale: float = 0.5                 # peak lr relative to cfg.train.lr when starting from init_from
     init_strict_alphabet: bool = False         # False: the alphabet may GROW (new characters appended as tied copies, [ALPHA-SPLIT])
+    # --- training budget ----------------------------------------------------------------------------------------------------------
+    auto_schedule: bool = False                # True: epochs, warm-ups, patience, refresh intervals ... from the data (inklingua/schedule.py)
+    deadline_unix: float = 0.0                 # > 0: stop at the end of the last epoch that fits before this time (resumable); 0 = no deadline
 
 
 @dataclass
@@ -352,9 +363,9 @@ class InferConfig:
     ig_steps: int = 12
     occl_window: int = 24
     occl_stride: int = 12
-    pl_diag_samples: int = 1500
+    pl_diag_samples: int = 1500                # 0 = no line-level pseudo-label diagnostics at evaluation
     selective_val_lines: int = 976
-    robustness_lines: int = 300
+    robustness_lines: int = 300                # 0 = no perturbation profile
     translation_ablation: bool = True
     render_translation: bool = True
     html_report: bool = True

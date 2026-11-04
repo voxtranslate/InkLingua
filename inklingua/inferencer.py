@@ -52,7 +52,12 @@ from .text import (CharCodec, align_chars, bootstrap_cer_ci, cer, chrf, detokeni
 from .utils import LOG, json_safe, to_device, torch_load
 
 try:
-    from tqdm.auto import tqdm
+    import warnings as _w
+    with _w.catch_warnings():
+        _w.simplefilter("ignore")
+        # not tqdm.auto: its asyncio class calls iter() in __init__, so a DataLoader started two iterators (twice the workers,
+        # one idle pair holding prefetched batches)
+        from tqdm.autonotebook import tqdm
 except Exception:  # pragma: no cover
     def tqdm(x, **kw):  # type: ignore
         return x
@@ -326,14 +331,16 @@ class Inferencer(PosthocMixin, InterpretMixin):
             return None
         nb = ctx["nbest"]
         i = ctx["i"]
-        lm, nt = self.llm.score_texts([detokenize(ds.display(i, t)) if ds.detok(i) else ds.display(i, t) for t, _ in nb])
+        lm, nt = self.llm.score_texts([detokenize(ds.display(i, t)) if ds.detok(i) else ds.display(i, t) for t, _ in nb], ds.language(i))
         return nb[int(np.argmax(fuse_scores(np.array([l for _, l in nb]), lm, nt, rs["beta"], rs["rho"])))][0]
 
     def _translate_block(self, ds, ctxs: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Cascade evaluation (handwriting -> text -> translation).  Headline numbers use ONLY the randomly drawn lines.  Arms: plain = top-1
         reading, plain prompt | uncertain = marked text + N-best, uncertain prompt | rescored = the validated LLM-rescored reading.  The primary
         `translation` column follows cfg.llm.use_uncertainty_prompt.  Every arm is scored against an oracle made with ITS OWN prompt."""
-        if not ctxs or not self.llm.available():
+        if not ctxs:
+            return {}
+        if not self.llm.available():
             LOG.warning("Translation skipped (no LLM available).")
             return {}
         rows, n_panels = [], 0
@@ -342,21 +349,25 @@ class Inferencer(PosthocMixin, InterpretMixin):
         for ctx in tqdm(ctxs, desc="translating", leave=False):
             i = ctx["i"]
             detok = ds.detok(i)
+            src_lang = ds.language(i)
+            tgt_lang = self.cfg.llm.target_language if src_lang != self.cfg.llm.target_language else ("en" if src_lang != "en" else "fr")
+            T = lambda h, unc_: self.llm.translate(h, uncertain=unc_, detok=detok, source_language=src_lang, target_language=tgt_lang)  # noqa: E731
             hyps = self._hyps(ds, ctx, self.cfg.llm.nbest)
-            unc = self.llm.translate(hyps, uncertain=True, detok=detok)
-            plain = self.llm.translate(hyps, uncertain=False, detok=detok)["translation"]
-            row = {"index": i, "tag": ctx.get("tag", "random"), "gt": ctx["gt_display"], "pred": ctx["pred_display"], "cer": ctx["cer"],
+            unc = T(hyps, True)
+            plain = T(hyps, False)["translation"]
+            row = {"index": i, "tag": ctx.get("tag", "random"), "source_language": src_lang, "target_language": tgt_lang,
+                   "gt": ctx["gt_display"], "pred": ctx["pred_display"], "cer": ctx["cer"],
                    "marked_text": unc["marked_text"], "uncertain_translation": unc["translation"], "plain_translation": plain,
                    "translation": unc["translation"] if use_unc else plain, "prompt_used": "uncertain" if use_unc else "plain",
                    "risk": risk_of.get(int(i), float("nan"))}
             if self.ic.translation_ablation:
-                ora = self.llm.translate([Hypothesis(ctx["gt_display"])], uncertain=False, detok=detok)["translation"]
-                ora_u = self.llm.translate([Hypothesis(ctx["gt_display"], [1.0] * len(ctx["gt_display"]))], uncertain=True, detok=detok)["translation"]
+                ora = T([Hypothesis(ctx["gt_display"])], False)["translation"]
+                ora_u = T([Hypothesis(ctx["gt_display"], [1.0] * len(ctx["gt_display"]))], True)["translation"]
                 row.update({"oracle_translation": ora, "oracle_translation_uncertain_prompt": ora_u, "chrf_plain_vs_oracle": chrf(plain, ora),
                             "chrf_uncertain_vs_oracle": chrf(unc["translation"], ora), "chrf_uncertain_vs_oracle_same_prompt": chrf(unc["translation"], ora_u)})
                 rr = self._rescored_reading(ds, ctx)
                 if rr is not None:
-                    rt = plain if rr == ctx["pred"] else self.llm.translate([Hypothesis(ds.display(i, rr))], uncertain=False, detok=detok)["translation"]
+                    rt = plain if rr == ctx["pred"] else T([Hypothesis(ds.display(i, rr))], False)["translation"]
                     row.update({"rescored_reading": ds.display(i, rr), "rescored_translation": rt, "chrf_rescored_vs_oracle": chrf(rt, ora)})
             if self.ic.render_translation and row["translation"] and n_panels < self.ic.render_translation_max:
                 self._translation_panel(ctx, row)
@@ -856,7 +867,7 @@ class Inferencer(PosthocMixin, InterpretMixin):
         for i, lp in tqdm(lps.items(), desc="N-best", leave=False):
             nb = ctc_prefix_beam_search(lp, self.ic.rescore_beam)
             res[int(i)] = {"texts": [codec.decode_ids(ids) for ids, _ in nb], "ctc": [float(l) for _, l in nb], "greedy": codec.decode_ids(greedy_decode(lp)[0]),
-                           "ref": ds.oracle[int(i)], "lm_texts": [detokenize(ds.display(int(i), codec.decode_ids(ids))) if ds.detok(int(i)) else ds.display(int(i), codec.decode_ids(ids)) for ids, _ in nb]}
+                           "ref": ds.oracle[int(i)], "lang": ds.language(int(i)), "lm_texts": [detokenize(ds.display(int(i), codec.decode_ids(ids))) if ds.detok(int(i)) else ds.display(int(i), codec.decode_ids(ids)) for ids, _ in nb]}
         return res
 
     def _llm_rescoring_eval(self, ds) -> Dict[str, Any]:
@@ -875,13 +886,14 @@ class Inferencer(PosthocMixin, InterpretMixin):
         nb_val, nb_ev = self._nbest_pass(self.data.val_ds, val_idx), self._nbest_pass(ds, ev_idx)
 
         def lm_scores(nb):
-            det = [t for v in nb.values() for t in v["lm_texts"]]
-            lm, nt = self.llm.score_texts(det)
-            pos = 0
-            for v in nb.values():
-                k = len(v["texts"])
-                v["lm"], v["ntok"] = lm[pos:pos + k], nt[pos:pos + k]
-                pos += k
+            for lang in sorted({v["lang"] for v in nb.values()}):
+                vs = [v for v in nb.values() if v["lang"] == lang]
+                lm, nt = self.llm.score_texts([t for v in vs for t in v["lm_texts"]], lang)
+                pos = 0
+                for v in vs:
+                    k = len(v["texts"])
+                    v["lm"], v["ntok"] = lm[pos:pos + k], nt[pos:pos + k]
+                    pos += k
 
         lm_scores(nb_val), lm_scores(nb_ev)
 
@@ -1027,8 +1039,10 @@ class Inferencer(PosthocMixin, InterpretMixin):
             with open(os.path.join(self.dirs["04_posthoc"], "posthoc.json"), "w") as f:
                 json.dump(json_safe(post), f, indent=2)
             R["ed_final"] = np.asarray(self.run_extra.get("final_edits", R["ed"]))
-        metrics["robustness"] = self._robustness(ds)
-        metrics["pseudo_label_reliability"] = self._pl_reliability()
+        if ic.robustness_lines > 0:
+            metrics["robustness"] = self._robustness(ds)
+        if ic.pl_diag_samples > 0:
+            metrics["pseudo_label_reliability"] = self._pl_reliability()
         resc = self._llm_rescoring_eval(ds)
         if resc:
             metrics["llm_rescoring"] = resc

@@ -13,11 +13,14 @@ Guarantees that a reader of the paper must be able to trust (all tested in inkli
 """
 from __future__ import annotations
 
+import fcntl
 import glob
 import hashlib
+import io
 import json
 import math
 import os
+import pickle
 import random
 import time
 from collections import Counter
@@ -36,7 +39,12 @@ from .text import CharCodec, ctc_min_frames, is_linguistic, normalize_text, text
 from .utils import LOG, json_safe
 
 try:
-    from tqdm.auto import tqdm
+    import warnings as _w
+    with _w.catch_warnings():
+        _w.simplefilter("ignore")
+        # not tqdm.auto: its asyncio class calls iter() in __init__, so a DataLoader started two iterators (twice the workers,
+        # one idle pair holding prefetched batches)
+        from tqdm.autonotebook import tqdm
 except Exception:  # pragma: no cover
     def tqdm(x, **kw):  # type: ignore
         return x
@@ -106,6 +114,62 @@ class HFSource(SplitSource):
         if not isinstance(im, Image.Image):
             raise TypeError(f"row {j}: expected a PIL image, got {type(im)}")
         return im
+
+    def text(self, j): return self._texts[int(j)]
+    def extra(self, j): return None if self._extra is None else str(self._extra[int(j)])
+
+
+class ParquetSource(SplitSource):
+    """One split read straight from its parquet file(s) with pyarrow: the transcriptions are read once; images are decoded on demand, one row
+    group at a time (the line cache reads the selected lines in increasing order, so every row group is read once).  Unlike the `datasets`
+    library this writes no second Arrow copy of the data to disk (the 12 registry corpora are ~15 GB of parquet)."""
+
+    IMAGE_COLS = HFSource.IMAGE_COLS
+    TEXT_COLS = HFSource.TEXT_COLS
+
+    def __init__(self, files: Sequence[str], image_col: Optional[str] = None, text_col: Optional[str] = None, style_col: Optional[str] = None):
+        import pyarrow.parquet as pq
+        self.paths = list(files)
+        self.files = [pq.ParquetFile(f) for f in self.paths]
+        names = self.files[0].schema_arrow.names
+        self.img_col = image_col or next((c for c in self.IMAGE_COLS if c in names), None)
+        self.txt_col = text_col or next((c for c in self.TEXT_COLS if c in names), None)
+        if self.img_col is None or self.txt_col is None:
+            raise ValueError(f"cannot find an image and a text column among {names} in {self.paths[0]}")
+        self._rg: List[Tuple[int, int, int, int]] = []
+        texts: List[Any] = []
+        extra: List[Any] = []
+        start = 0
+        for fi, pf in enumerate(self.files):
+            for rg in range(pf.num_row_groups):
+                n = pf.metadata.row_group(rg).num_rows
+                self._rg.append((fi, rg, start, n))
+                start += n
+            texts += pf.read(columns=[self.txt_col]).column(0).to_pylist()
+            if style_col and style_col in names:
+                extra += pf.read(columns=[style_col]).column(0).to_pylist()
+        self._texts = [normalize_text(str(t)) for t in texts]
+        self._extra = extra if extra else None
+        self._starts = np.array([r[2] for r in self._rg], np.int64)
+        self._cur: Tuple[Optional[int], Optional[List[Any]]] = (None, None)
+
+    def __len__(self): return len(self._texts)
+
+    def image(self, j):
+        j = int(j)
+        k = int(np.searchsorted(self._starts, j, side="right") - 1)
+        fi, rg, start, n = self._rg[k]
+        if self._cur[0] != k:
+            self._cur = (k, self.files[fi].read_row_group(rg, columns=[self.img_col]).column(0).to_pylist())
+        v = self._cur[1][j - start]
+        if isinstance(v, dict):
+            if v.get("bytes") is not None:
+                return Image.open(io.BytesIO(v["bytes"]))
+            if v.get("path"):
+                return Image.open(v["path"])
+        if isinstance(v, (bytes, bytearray)):
+            return Image.open(io.BytesIO(v))
+        raise TypeError(f"row {j}: cannot decode an image from {type(v)}")
 
     def text(self, j): return self._texts[int(j)]
     def extra(self, j): return None if self._extra is None else str(self._extra[int(j)])
@@ -185,35 +249,172 @@ class ListSource(SplitSource):
 # ==============================================================================
 # the line cache
 # ==============================================================================
+class InkStore:
+    """Read-only sequence of preprocessed uint8 lines (H x w_i) kept in flat byte segments: a memory-mapped file of the disk line cache
+    (the operating system's page cache is then shared by the two parallel runs and by every data-loader worker: no run holds a private
+    copy of a corpus, and forked workers do not duplicate it copy-on-write) or an in-memory array.  `ref[i] = (segment, line)`, so
+    subsets and concatenations are index operations that copy no pixels.  Pickling keeps file paths, never pixel data."""
+
+    def __init__(self, segs: List[Dict[str, Any]], ref: np.ndarray):
+        self.segs, self.ref = segs, np.asarray(ref, np.int64).reshape(-1, 2)
+        self._maps: Dict[int, np.ndarray] = {}
+
+    @staticmethod
+    def from_arrays(arrs: Sequence[np.ndarray]) -> "InkStore":
+        arrs = [np.ascontiguousarray(a, np.uint8) for a in arrs]
+        off = np.zeros(len(arrs) + 1, np.int64)
+        off[1:] = np.cumsum([a.size for a in arrs])
+        flat = np.concatenate([a.ravel() for a in arrs]) if arrs else np.zeros(0, np.uint8)
+        seg = {"path": None, "data": flat, "off": off, "h": np.array([a.shape[0] for a in arrs], np.int64),
+               "w": np.array([a.shape[1] for a in arrs], np.int64)}
+        return InkStore([seg], np.stack([np.zeros(len(arrs), np.int64), np.arange(len(arrs))], 1))
+
+    @staticmethod
+    def from_file(path: str, off: np.ndarray, h: np.ndarray, w: np.ndarray) -> "InkStore":
+        seg = {"path": path, "data": None, "off": np.asarray(off, np.int64), "h": np.asarray(h, np.int64), "w": np.asarray(w, np.int64)}
+        return InkStore([seg], np.stack([np.zeros(len(w), np.int64), np.arange(len(w))], 1))
+
+    def _flat(self, s: int) -> np.ndarray:
+        seg = self.segs[s]
+        if seg["data"] is not None:
+            return seg["data"]
+        m = self._maps.get(s)
+        if m is None:
+            m = self._maps[s] = (np.memmap(seg["path"], np.uint8, mode="r") if int(seg["off"][-1]) > 0 else np.zeros(0, np.uint8))
+        return m
+
+    def __len__(self) -> int:
+        return len(self.ref)
+
+    def __getitem__(self, i: int) -> np.ndarray:
+        s, j = (int(v) for v in self.ref[int(i)])
+        seg = self.segs[s]
+        a, b = int(seg["off"][j]), int(seg["off"][j + 1])
+        return self._flat(s)[a:b].reshape(int(seg["h"][j]), int(seg["w"][j]))
+
+    def __iter__(self):
+        return (self[i] for i in range(len(self)))
+
+    def subset(self, keep: Sequence[int]) -> "InkStore":
+        return InkStore(self.segs, self.ref[np.asarray(keep, np.int64)])
+
+    @staticmethod
+    def concat(stores: Sequence["InkStore"]) -> "InkStore":
+        segs: List[Dict[str, Any]] = []
+        refs = []
+        for st in stores:
+            r = st.ref.copy()
+            r[:, 0] += len(segs)
+            segs += st.segs
+            refs.append(r)
+        return InkStore(segs, np.concatenate(refs) if refs else np.zeros((0, 2), np.int64))
+
+    def nbytes(self) -> int:
+        return int(sum(int(s["off"][-1]) for s in self.segs))
+
+    def __getstate__(self):
+        return {"segs": self.segs, "ref": self.ref}
+
+    def __setstate__(self, st):
+        self.segs, self.ref, self._maps = st["segs"], st["ref"], {}
+
+
 def build_line_cache(src: SplitSource, indices: np.ndarray, H: int, max_w: int, min_w: int, pad_x: int, desc: str,
-                     keep_ink: bool = True) -> Dict[str, Any]:
+                     keep_ink: bool = True, ink_path: Optional[str] = None) -> Dict[str, Any]:
     """One decoding pass over the selected lines: preprocessed uint8 ink (optional), widths, style descriptors and a content digest
-    (used to prove that no image occurs in two splits).  A corrupt image raises immediately -- lines are never skipped silently."""
+    (used to prove that no image occurs in two splits).  A corrupt image raises immediately -- lines are never skipped silently.
+    With `ink_path` the pixels are streamed to that file (the RAM never holds the corpus) and returned as a memory-mapped InkStore."""
     n = len(indices)
     width, style = np.zeros(n, np.int64), np.zeros((n, NUM_DESC), np.float32)
-    ink: List[Optional[np.ndarray]] = []
+    heights, off = np.zeros(n, np.int64), np.zeros(n + 1, np.int64)
+    arrs: List[np.ndarray] = []
     digest: List[str] = []
-    for k, j in enumerate(tqdm(indices, desc=desc, leave=False)):
-        try:
-            u8 = to_u8(preprocess_line(src.image(int(j)), H, max_w, min_w, pad_x))
-        except Exception as e:
-            raise RuntimeError(f"{desc}: line {int(j)} could not be decoded: {e}") from e
-        width[k] = u8.shape[1]
-        style[k] = compute_style_descriptors(u8.astype(np.float32) / 255.0)
-        digest.append(hashlib.blake2b(u8.tobytes(), digest_size=8).hexdigest())
-        ink.append(u8 if keep_ink else None)
+    fh = open(ink_path, "wb") if (keep_ink and ink_path) else None
+    try:
+        for k, j in enumerate(tqdm(indices, desc=desc, leave=False)):
+            try:
+                u8 = np.ascontiguousarray(to_u8(preprocess_line(src.image(int(j)), H, max_w, min_w, pad_x)), np.uint8)
+            except Exception as e:
+                raise RuntimeError(f"{desc}: line {int(j)} could not be decoded: {e}") from e
+            heights[k], width[k] = u8.shape
+            off[k + 1] = off[k] + u8.size
+            style[k] = compute_style_descriptors(u8.astype(np.float32) / 255.0)
+            digest.append(hashlib.blake2b(u8.tobytes(), digest_size=8).hexdigest())
+            if fh is not None:
+                fh.write(u8.tobytes())
+            elif keep_ink:
+                arrs.append(u8)
+    finally:
+        if fh is not None:
+            fh.close()
+    if not keep_ink:
+        ink: Any = [None] * n
+    elif ink_path:
+        ink = InkStore.from_file(ink_path, off, heights, width)
+    else:
+        ink = InkStore.from_arrays(arrs)
     return {"ink": ink, "width": width, "style": style, "digest": digest}
+
+
+def cached_line_cache(cache_dir: Optional[str], key: Dict[str, Any], build) -> Dict[str, Any]:
+    """Disk cache of build_line_cache, shared by every run that reads the same lines with the same preprocessing (a corpus is decoded once
+    per session instead of once per run).  `key` must identify the source, the selected lines and the preprocessing; a file lock keeps two
+    parallel runs from building the same entry twice; writes are atomic.  `build(ink_path)` streams the pixels to `<entry>.ink` (memory-
+    mapped by every reader); the metadata (widths, styles, digests, offsets) is a small pickle."""
+    if not cache_dir:
+        return build(None)
+    os.makedirs(cache_dir, exist_ok=True)
+    h = hashlib.sha1(json.dumps(key, sort_keys=True).encode()).hexdigest()[:20]
+    path = os.path.join(cache_dir, f"{key.get('corpus', 'lines')}_{key.get('split', '')}_{h}.pkl")
+    ink_path = path[:-4] + ".ink"
+    with open(path + ".lock", "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        try:
+            if os.path.exists(path) and (os.path.exists(ink_path) or not key.get("ink", True)):
+                with open(path, "rb") as f:
+                    meta = pickle.load(f)
+                if meta.get("ink_off") is not None:
+                    meta["ink"] = InkStore.from_file(ink_path, meta.pop("ink_off"), meta.pop("ink_h"), meta["width"])
+                else:
+                    meta["ink"] = [None] * len(meta["width"])
+                return meta
+            out = build(ink_path + ".tmp")
+            meta = {k: v for k, v in out.items() if k != "ink"}
+            if isinstance(out["ink"], InkStore):
+                seg = out["ink"].segs[0]
+                meta["ink_off"], meta["ink_h"] = seg["off"], seg["h"]
+                os.replace(ink_path + ".tmp", ink_path)
+                out["ink"] = InkStore.from_file(ink_path, seg["off"], seg["h"], seg["w"])
+            else:
+                meta["ink_off"] = meta["ink_h"] = None
+            tmp = path + ".tmp"
+            with open(tmp, "wb") as f:
+                pickle.dump(meta, f, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(tmp, path)
+            return out
+        finally:
+            fcntl.flock(lk, fcntl.LOCK_UN)
+
+
+def _ink_concat(parts: List[Any]) -> Any:
+    if any(isinstance(p, InkStore) for p in parts):
+        return InkStore.concat([p if isinstance(p, InkStore) else InkStore.from_arrays(list(p)) for p in parts])
+    return sum((list(p) for p in parts), [])
+
+
+def _ink_subset(ink: Any, keep: np.ndarray) -> Any:
+    return ink.subset(keep) if isinstance(ink, InkStore) else [ink[i] for i in keep]
 
 
 def _concat_caches(caches: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not caches:
         return {"ink": [], "width": np.zeros(0, np.int64), "style": np.zeros((0, NUM_DESC), np.float32), "digest": []}
-    return {"ink": sum((c["ink"] for c in caches), []), "width": np.concatenate([c["width"] for c in caches]),
+    return {"ink": _ink_concat([c["ink"] for c in caches]), "width": np.concatenate([c["width"] for c in caches]),
             "style": np.concatenate([c["style"] for c in caches]), "digest": sum((c["digest"] for c in caches), [])}
 
 
 def _subset_cache(cache: Dict[str, Any], keep: np.ndarray) -> Dict[str, Any]:
-    return {"ink": [cache["ink"][i] for i in keep], "width": cache["width"][keep], "style": cache["style"][keep],
+    return {"ink": _ink_subset(cache["ink"], keep), "width": cache["width"][keep], "style": cache["style"][keep],
             "digest": [cache["digest"][i] for i in keep]}
 
 
@@ -291,8 +492,9 @@ class HandwritingDataset(Dataset):
 # ==============================================================================
 class Collator:
     def __init__(self, codec: CharCodec, pad_multiple: int = 4, mix_prob: float = 0.0, max_w: int = 2560,
-                 gap: Tuple[int, int] = (0, 24), seed: int = 0):
+                 gap: Tuple[int, int] = (0, 24), seed: int = 0, nospace_domains: Sequence[int] = ()):
         self.codec, self.pm = codec, pad_multiple
+        self.nospace = frozenset(int(d) for d in nospace_domains)       # corpora written without word spaces (Han): lines are juxtaposed
         self.mix_prob, self.max_w, self.gap, self.seed = float(mix_prob), int(max_w), tuple(gap), int(seed)
 
     def _mix(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -301,7 +503,7 @@ class Collator:
         correctly (the label of the right-hand image part comes last)."""
         rng = np.random.RandomState((int(sum(int(it["index"]) for it in items)) * 2654435761 + self.seed) % (2 ** 32))
         out: List[Dict[str, Any]] = []
-        sep = " " if " " in self.codec.c2i else ""             # scripts written without word spaces are simply juxtaposed
+        space = " " if " " in self.codec.c2i else ""
         k = 0
         while k < len(items):
             a = items[k]
@@ -309,6 +511,7 @@ class Collator:
             if (b is not None and a["labeled"] and b["labeled"] and a["weight"] > 0 and b["weight"] > 0 and a["text"] and b["text"]
                     and a.get("domain", 0) == b.get("domain", 0) and rng.rand() < self.mix_prob):
                 g = int(rng.randint(self.gap[0], self.gap[1] + 1))
+                sep = "" if int(a.get("domain", 0)) in self.nospace else space
                 w = int(a["width"]) + g + int(b["width"])
                 if w <= self.max_w:
                     img = torch.zeros(1, a["image"].shape[1], w)
@@ -428,7 +631,7 @@ class HandwritingDataModule:
         for attempt in range(3):
             try:
                 LOG.info("Downloading / loading '%s' (revision %s, attempt %d) ...", spec.hf_dataset, spec.hf_revision or "latest", attempt + 1)
-                return load_dataset(spec.hf_dataset, cache_dir=os.path.join(self.cfg.data_dir, "hf"), revision=spec.hf_revision)
+                return load_dataset(spec.hf_dataset, cache_dir=os.path.join(self.cfg.data_dir, "hf", spec.key), revision=spec.hf_revision)
             except Exception as e:  # network / hub errors
                 err = e
                 LOG.warning("attempt %d failed: %s", attempt + 1, e)
@@ -436,6 +639,62 @@ class HandwritingDataModule:
         raise RuntimeError(f"could not obtain '{spec.hf_dataset}' ({err}).\nCheck the internet connection (on Kaggle: Settings -> "
                            "Internet on), or download the parquet files once and set DatasetSpec.local_dir / cfg.data.local_dir.  "
                            "There is deliberately NO synthetic fallback.")
+
+    @staticmethod
+    def _split_files(d: str, spec: DatasetSpec) -> Dict[str, List[str]]:
+        """{split name: parquet files} under folder d, for the train / validation / test split names of the spec (with common aliases)."""
+        aliases = {spec.train_split: (spec.train_split, "train"), spec.val_split: (spec.val_split, "validation", "val", "valid", "dev")}
+        if spec.test_split:
+            aliases[spec.test_split] = (spec.test_split, "test")
+        files: Dict[str, List[str]] = {}
+        for split, al in aliases.items():
+            f: List[str] = []
+            for a in dict.fromkeys(al):
+                f += glob.glob(os.path.join(d, f"{a}*.parquet")) + glob.glob(os.path.join(d, "**", f"{a}*.parquet"), recursive=True)
+            if not f:
+                raise FileNotFoundError(f"no '{split}*.parquet' file found under {d}")
+            files[split] = sorted(set(f))
+        return files
+
+    def _load_parquet(self, spec: DatasetSpec, local: Optional[str]) -> Dict[str, Optional[SplitSource]]:
+        """Parquet reader path: a local folder, or the Hub snapshot of the pinned revision (parquet files only)."""
+        if local:
+            root, commit = local, None
+        else:
+            from huggingface_hub import snapshot_download
+            err = None
+            for attempt in range(3):
+                try:
+                    LOG.info("Downloading '%s' (revision %s, parquet only, attempt %d) ...", spec.hf_dataset, spec.hf_revision or "latest", attempt + 1)
+                    root = snapshot_download(repo_id=spec.hf_dataset, repo_type="dataset", revision=spec.hf_revision, allow_patterns=["*.parquet"],
+                                             cache_dir=os.path.join(self.cfg.data_dir, "hub", spec.key))
+                    break
+                except Exception as e:
+                    err = e
+                    LOG.warning("attempt %d failed: %s", attempt + 1, e)
+                    time.sleep(5 * (attempt + 1))
+            else:
+                raise RuntimeError(f"could not obtain '{spec.hf_dataset}' ({err}).  Check the internet connection (Kaggle: Settings -> Internet on) "
+                                   "or set DatasetSpec.local_dir.  There is deliberately NO synthetic fallback.")
+            commit = os.path.basename(os.path.normpath(root)) if "snapshots" in root else None
+        files = self._split_files(root, spec)
+        col = self.dc.style_label_column
+        mk = lambda split: ParquetSource(files[split], spec.image_col, spec.text_col, col)  # noqa: E731
+        out = {"train": mk(spec.train_split), "val": mk(spec.val_split), "test": mk(spec.test_split) if spec.test_split else None}
+        raw = [len(out["train"]), len(out["val"])] + ([len(out["test"])] if out["test"] is not None else [])
+        prov = {"dataset": spec.hf_dataset or local, "requested_revision": spec.hf_revision, "resolved_commit": commit, "raw_sizes": raw,
+                "language": spec.language, "script": spec.script, "era": spec.era, "rtl": spec.rtl, "licence": spec.licence, "local": bool(local),
+                "reader": "parquet", "files": {k: [os.path.basename(f) for f in v] for k, v in files.items()}}
+        if commit and spec.hf_revision and commit != spec.hf_revision:
+            LOG.warning("[%s] resolved commit %s differs from the pinned revision %s", spec.key, commit, spec.hf_revision)
+        LOG.info("[%s] splits: %s (parquet reader)", spec.key, dict(zip(("train", "validation", "test"), raw)))
+        if spec.expected_sizes is not None and tuple(raw) != tuple(spec.expected_sizes):
+            msg = f"dataset '{spec.key}': split sizes {raw} differ from the expected {tuple(spec.expected_sizes)} (wrong / truncated / other version?)"
+            if self.dc.strict_checks:
+                raise RuntimeError(msg + "  Set DatasetSpec.expected_sizes=None or cfg.data.strict_checks=False to override.")
+            LOG.warning(msg)
+        self.provenance.setdefault("sources", {})[spec.key] = prov
+        return out
 
     def _load_local(self, load_dataset, d: str, spec: DatasetSpec):
         if not d or not os.path.isdir(d):
@@ -458,14 +717,16 @@ class HandwritingDataModule:
 
     def _load_spec(self, spec: DatasetSpec) -> Dict[str, Optional[SplitSource]]:
         """{'train': src, 'val': src, 'test': src or None} for one corpus."""
-        try:
-            from datasets import load_dataset
-        except Exception as e:
-            raise ImportError(f"`datasets` is required for real data: pip install datasets ({e})") from e
         local = spec.local_dir or (self.dc.local_dir if (self.dc.source == "local" and len(self.specs) == 1) else None)
         if self.dc.source == "local" and local is None:
             raise ValueError(f"cfg.data.source='local' but dataset '{spec.key}' has no local_dir (set DatasetSpec.local_dir, or cfg.data.local_dir "
                              f"for a single source)")
+        if self.dc.reader == "parquet" and (local is None or not os.path.exists(os.path.join(local, "dataset_dict.json"))):
+            return self._load_parquet(spec, local)
+        try:
+            from datasets import load_dataset
+        except Exception as e:
+            raise ImportError(f"`datasets` is required for real data: pip install datasets ({e})") from e
         dsd = self._load_local(load_dataset, local, spec) if local else self._download(load_dataset, spec)
         names = list(dsd.keys())
 
@@ -527,11 +788,39 @@ class HandwritingDataModule:
 
     # ---------------------------------------------------------------- prepare
     @staticmethod
-    def _select(n: int, limit: Optional[int], seed: int) -> np.ndarray:
+    def _select(n: int, limit: Optional[int], seed: int, block: int = 1) -> np.ndarray:
+        """All n lines, or a seeded subset of `limit` lines made of WHOLE blocks of `block` consecutive lines (lines are stored form by form;
+        a line-level random subset would break the form structure that the clustered bootstrap and the val_sel / val_gate split rely on)."""
         idx = np.arange(n)
-        if limit is not None and limit < len(idx):
-            idx = np.sort(np.random.RandomState(seed).permutation(idx)[:limit])
-        return idx
+        if limit is None or limit >= n:
+            return idx
+        block = max(1, int(block))
+        nb = int(math.ceil(n / block))
+        order = np.random.RandomState(seed).permutation(nb)
+        keep, tot = [], 0
+        for b in order:
+            seg = idx[b * block:(b + 1) * block]
+            keep.append(seg)
+            tot += len(seg)
+            if tot >= limit:
+                break
+        return np.sort(np.concatenate(keep))[:max(limit, 0)] if keep else idx[:0]
+
+    def _decontaminate(self, cache, text, src_id, indices, domain) -> Dict[str, int]:
+        """Drop train lines whose preprocessed image also occurs in validation or test, and validation lines that also occur in test
+        (exact content digest).  Needed when corpora that share material are combined (e.g. two releases of one collection)."""
+        rep = {}
+        for k, others in (("train", ("val", "test")), ("val", ("test",))):
+            bad = set().union(*[set(cache[o]["digest"]) for o in others])
+            keep = np.array([d not in bad for d in cache[k]["digest"]], bool)
+            rep[f"removed_from_{k}"] = int((~keep).sum())
+            if (~keep).any():
+                kk = np.flatnonzero(keep)
+                cache[k] = _subset_cache(cache[k], kk)
+                text[k] = [text[k][i] for i in kk]
+                src_id[k], indices[k], domain[k] = src_id[k][kk], indices[k][kk], domain[k][kk]
+        LOG.info("decontamination: %s", rep)
+        return rep
 
     def _integrity(self, cache: Dict[str, Dict[str, Any]], text: Dict[str, List[str]]) -> Dict[str, Any]:
         rep: Dict[str, Any] = {}
@@ -566,9 +855,14 @@ class HandwritingDataModule:
                 if src is None:
                     continue
                 cap = (spec.max_lines or {}).get({"train": "train", "val": "validation", "test": "test"}[k])
-                sel = self._select(len(src), cap, seed + 100 * d + {"train": 0, "val": 1, "test": 2}[k])
-                caches.append(build_line_cache(src, sel, dc.img_height, dc.max_img_width, dc.min_img_width, dc.pad_x,
-                                               f"decoding [{spec.key}/{k}]", dc.cache_images))
+                sel = self._select(len(src), cap, dc.subset_seed + 100 * d + {"train": 0, "val": 1, "test": 2}[k], dc.cap_block)
+                ckey = {"corpus": spec.key, "split": k, "source": spec.hf_dataset or spec.local_dir or "", "revision": spec.hf_revision,
+                        "n": len(src), "sel": hashlib.sha1(np.asarray(sel, np.int64).tobytes()).hexdigest(), "H": dc.img_height,
+                        "max_w": dc.max_img_width, "min_w": dc.min_img_width, "pad_x": dc.pad_x, "ink": bool(dc.cache_images), "v": 2}
+                build = (lambda ink_path, src=src, sel=sel, spec=spec, k=k: build_line_cache(src, sel, dc.img_height, dc.max_img_width, dc.min_img_width,
+                                                                                            dc.pad_x, f"decoding [{spec.key}/{k}]", dc.cache_images, ink_path))
+                use_disk = dc.line_cache_dir if (spec.key != "synthetic" and not self.is_synthetic) else None
+                caches.append(cached_line_cache(use_disk, ckey, build))
                 texts += [to_visual(src.text(int(j)), spec.rtl) for j in sel]
                 sids.append(np.full(len(sel), len(sources[k]), np.int64))
                 sources[k].append(src)
@@ -581,12 +875,14 @@ class HandwritingDataModule:
             domain[k] = np.concatenate(doms) if doms else np.zeros(0, np.int64)
             limit = {"train": dc.limit_train, "val": dc.limit_val, "test": dc.limit_test}[k]
             if limit is not None and limit < len(text[k]):
-                keep = self._select(len(text[k]), limit, seed + {"train": 0, "val": 1, "test": 2}[k])
+                keep = self._select(len(text[k]), limit, dc.subset_seed + {"train": 0, "val": 1, "test": 2}[k], dc.cap_block)
                 cache[k] = _subset_cache(cache[k], keep)
                 text[k] = [text[k][i] for i in keep]
                 src_id[k], indices[k], domain[k] = src_id[k][keep], indices[k][keep], domain[k][keep]
         if len(text["test"]) == 0:
             raise RuntimeError("no corpus contributes test lines (every DatasetSpec has test_split=None): nothing to evaluate on")
+        if dc.decontaminate:
+            prov["decontamination"] = self._decontaminate(cache, text, src_id, indices, domain)
         prov["integrity"] = self._integrity(cache, text)
         LOG.info("Example (train line 0, %s): %r | preprocessed width %d px", self.specs[int(domain["train"][0])].key, text["train"][0],
                  int(cache["train"]["width"][0]))
@@ -769,8 +1065,9 @@ class HandwritingDataModule:
         """`indices` = the lines of this epoch (may contain repeats); default: every train line once."""
         s = BucketBatchSampler(self.train_ds.width, self.dc.batch_size, True, self.dc.bucket_mega, seed=self.cfg.run.seed, indices=indices)
         tc = self.cfg.train
+        nospace = [d for d, sp in enumerate(self.specs) if sp.script in ("Han",)]
         return self._loader(self.train_ds, s, collator=Collator(self.codec, mix_prob=tc.mixline_prob, max_w=self.dc.max_img_width,
-                                                                  gap=tc.mixline_gap, seed=self.cfg.run.seed))
+                                                                  gap=tc.mixline_gap, seed=self.cfg.run.seed, nospace_domains=nospace))
 
     def eval_loader(self, ds: HandwritingDataset, indices: Optional[Sequence[int]] = None, batch_size: Optional[int] = None) -> DataLoader:
         s = BucketBatchSampler(ds.width, batch_size or self.dc.eval_batch_size, False, indices=indices)

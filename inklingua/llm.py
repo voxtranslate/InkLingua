@@ -192,12 +192,14 @@ class LLMEngine:
             LOG.warning("LLM could not be loaded (%s). Translation / LLM rescoring will be skipped.", e)
 
     @torch.no_grad()
-    def score_texts(self, texts: List[str]) -> Tuple[np.ndarray, np.ndarray]:
-        """Sum of token log-probs and #tokens of every text under the causal LM (cached, batched by length)."""
+    def score_texts(self, texts: List[str], language: Optional[str] = None) -> Tuple[np.ndarray, np.ndarray]:
+        """Sum of token log-probs and #tokens of every text under the causal LM, conditioned on the written language (default:
+        cfg.source_language; a multi-corpus run passes each line's own language).  Cached per (language, text), batched by length."""
         assert self.can_score()
-        cache = self.__dict__.setdefault("_lm_cache", {})
+        lang = language or self.cfg.source_language
+        cache = self.__dict__.setdefault("_lm_cache", {}).setdefault(lang, {})
         todo = sorted({t for t in texts if t not in cache}, key=len)
-        prefix = f"Transcription of a line of {lang_name(self.cfg.source_language)} handwriting:\n"
+        prefix = f"Transcription of a line of {lang_name(lang)} handwriting:\n"
         pre = self.tok(prefix, add_special_tokens=False).input_ids
         pad = self.tok.pad_token_id if self.tok.pad_token_id is not None else 0
         for i in range(0, len(todo), self.cfg.score_batch_size):
@@ -269,10 +271,15 @@ class LLMEngine:
 
     @torch.no_grad()
     def translate(self, hyps: List[Hypothesis], uncertain: Optional[bool] = None, target_language: Optional[str] = None,
-                  detok: bool = False) -> Dict[str, Any]:
+                  detok: bool = False, source_language: Optional[str] = None) -> Dict[str, Any]:
         """hyps[0] is the best hypothesis (logical order).  uncertain=False -> plain top-1 translation.  detok=True re-attaches IAM
         tokenisation before prompting (only for corpora whose spec says so)."""
         c = self.cfg
+        if source_language and source_language != c.source_language:
+            if c.backend == "seq2seq":
+                eng = self.__dict__.setdefault("_by_source", {}).setdefault(source_language, LLMEngine(dataclasses.replace(c, source_language=source_language), self.device))
+                return eng.translate(hyps, uncertain, target_language, detok)
+            c = dataclasses.replace(c, source_language=source_language)
         if target_language is not None and target_language != c.target_language:
             if c.backend == "seq2seq":
                 return self.for_target(target_language).translate(hyps, uncertain, detok=detok)

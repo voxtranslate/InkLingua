@@ -29,31 +29,31 @@ DATASETS: Dict[str, DatasetSpec] = {
         script="Latin", expected_sizes=(10188, 1138, 778), licence="Hub: MIT; RIMES: research",
         note="Modern French letters (RIMES 2011 line level)."),
     "belfort": DatasetSpec(
-        key="belfort", hf_dataset="Teklia/Belfort-line", hf_revision="1e1caa665d48aa6756313cc0f72416f628de34c3", language="fr",
+        key="belfort", era="historical", hf_dataset="Teklia/Belfort-line", hf_revision="1e1caa665d48aa6756313cc0f72416f628de34c3", language="fr",
         script="Latin", expected_sizes=(25800, 3102, 3819), licence="Hub: MIT",
         note="Historical French municipal registers (Belfort), 19th-20th c."),
     "esposalles": DatasetSpec(
-        key="esposalles", hf_dataset="Teklia/Esposalles-line", hf_revision="5f8e7ceccb126528ebae15cb81c475403d176ee4", language="ca",
+        key="esposalles", era="historical", hf_dataset="Teklia/Esposalles-line", hf_revision="5f8e7ceccb126528ebae15cb81c475403d176ee4", language="ca",
         script="Latin", expected_sizes=(2328, 742, 757), licence="Hub: MIT", note="17th-century Catalan marriage licences."),
     "himanis": DatasetSpec(
-        key="himanis", hf_dataset="Teklia/Himanis-line", hf_revision="3793c910e6c087ebc1d575ab7384d8d60ad7eafd", language="la",
+        key="himanis", era="historical", hf_dataset="Teklia/Himanis-line", hf_revision="3793c910e6c087ebc1d575ab7384d8d60ad7eafd", language="la",
         script="Latin", expected_sizes=(18504, 2367, 2241), licence="Hub: MIT", note="Medieval Latin / French chancery registers."),
     "home_alcar": DatasetSpec(
-        key="home_alcar", hf_dataset="Teklia/HOME-Alcar-line", hf_revision="edb8b023ebd6c0c92ad61adcdd550cfee6e34a18", language="la",
+        key="home_alcar", era="historical", hf_dataset="Teklia/HOME-Alcar-line", hf_revision="edb8b023ebd6c0c92ad61adcdd550cfee6e34a18", language="la",
         script="Latin", expected_sizes=(59969, 7905, 6932), licence="Hub: MIT", note="Medieval Latin cartularies (HOME-Alcar)."),
     "newseye_de": DatasetSpec(
-        key="newseye_de", hf_dataset="Teklia/NewsEye-Austrian-line", hf_revision="8d6b94c016b7cb455ad77c7ac67f80036ebfb752",
+        key="newseye_de", era="historical", hf_dataset="Teklia/NewsEye-Austrian-line", hf_revision="8d6b94c016b7cb455ad77c7ac67f80036ebfb752",
         language="de", script="Latin", test_split=None, expected_sizes=(51588, 4379), licence="Hub: MIT",
         note="Austrian German; NO test split on the Hub -> contributes train / validation lines only."),
     "norhand1": DatasetSpec(
-        key="norhand1", hf_dataset="Teklia/NorHand-v1-line", hf_revision="2725c76fe2bd2c0f100c641621e21f4887cbb26c", language="nb",
+        key="norhand1", era="historical", hf_dataset="Teklia/NorHand-v1-line", hf_revision="2725c76fe2bd2c0f100c641621e21f4887cbb26c", language="nb",
         script="Latin", expected_sizes=(19653, 2286, 1793), licence="Hub: MIT", note="Norwegian letters and diaries, 19th-20th c."),
     "norhand3": DatasetSpec(
-        key="norhand3", hf_dataset="Teklia/NorHand-v3-line", hf_revision="113280c8fbb7f6df7923ee15a7ba3c97710a8f1c", language="nb",
+        key="norhand3", era="historical", hf_dataset="Teklia/NorHand-v3-line", hf_revision="113280c8fbb7f6df7923ee15a7ba3c97710a8f1c", language="nb",
         script="Latin", expected_sizes=(222381, 22679, 1562), licence="Hub: MIT",
         note="Large Norwegian corpus (222k train lines): use max_lines to cap it."),
     "popp": DatasetSpec(
-        key="popp", hf_dataset="Teklia/POPP-line", hf_revision="7ab15c7589c164fc13cb42adccf68e61c05b2945", language="fr",
+        key="popp", era="historical", hf_dataset="Teklia/POPP-line", hf_revision="7ab15c7589c164fc13cb42adccf68e61c05b2945", language="fr",
         script="Latin", expected_sizes=(3835, 480, 479), licence="Hub: MIT", note="Paris census tables (POPP), 1926-1946."),
     "casia": DatasetSpec(
         key="casia", hf_dataset="Teklia/CASIA-HWDB2-line", hf_revision="2974a15ceab0657047a28d2a71b76bd7544d4663", language="zh",

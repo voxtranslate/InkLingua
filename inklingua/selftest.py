@@ -697,6 +697,94 @@ def run_self_tests(verbose: bool = True) -> None:
     res, sink = contrast_rollout(shared)
     assert 0.8 < sink < 0.9 and [int(np.argmax(res[r])) for r in range(3)] == [8, 15, 30]
     ok("protocol split, MixLine, FRAG-RC in the training loop, lr schedule on resume, suite aggregation, config round trips, explainability helpers")
+    # ---- v11 experiment plan: budget rule, plan, statistics, block caps, decontamination, parquet reader ----------------------------
+    from .datasets_registry import DATASETS
+    from .experiments import PlanConfig, build_runs, run_config
+    from .paper import holm, pooled_paired, sign_test
+    from .schedule import apply_budget, budget, complexity_factor
+    bi = budget(6482, complexity_factor([DATASETS["iam"]], [6482]), 16)
+    d0 = Config()
+    assert (bi["epochs"], bi["patience"], bi["min_epochs"], bi["frag_warmup"], bi["frag_refresh"]) == (d0.train.epochs, d0.train.patience, d0.train.min_epochs,
+                                                                                                    d0.train.frag.warmup_epochs, d0.train.frag.refresh_every)
+    assert budget(2328, 1.15, 16)["epochs"] == 150 and budget(60000, 1.15, 16)["epochs"] < 50 and complexity_factor([DATASETS["casia"]], [1]) == 1.8
+    tmpp = tempfile.mkdtemp()
+    pl = PlanConfig(work_dir=tmpp, cache_dir=tmpp)
+    rr = build_runs(pl)
+    ids_ = [r["id"] for r in rr]
+    assert len(ids_) == len(set(ids_)) and ids_[0] == "iam/labeled_only_lf030_s1337" and sum(r["profile"] == "full" for r in rr) == len(pl.corpora) + 1
+    assert all(r["stage"] != "newseye_de" for r in rr) and any(r["kind"] == "adapt" and r["deps"] == ["iam/full_lf030_s1337"] for r in rr)
+    stages_in_order = list(dict.fromkeys(r["stage"] for r in rr if r["kind"] == "run"))
+    assert stages_in_order == list(pl.corpora) + ["joint"], stages_in_order                       # corpus after corpus
+    cv = run_config(pl, next(r for r in rr if r["variant"] == "no_vq"))
+    apply_budget(cv, bi)
+    assert cv.train.vq_start_epoch == 10 ** 6 and cv.llm.backend == "causal" and not cv.run.self_test and cv.data.source == "hf"
+    assert all(run_config(pl, r).llm.backend == "causal" for r in rr[:5])
+    shutil.rmtree(tmpp, ignore_errors=True)
+    rs_ = np.random.RandomState(0)
+    prs = []
+    for _ in range(3):
+        eb_ = rs_.poisson(4, 600).astype(float)
+        prs.append((np.maximum(eb_ - rs_.binomial(1, .3, 600), 0), eb_, np.full(600, 40.0), np.arange(600) // 20))
+    tp = pooled_paired(prs, 800)
+    assert tp["delta"] < 0 and tp["hi"] < 0 and tp["p"] < 0.01 and pooled_paired([(b, b, l, g) for _, b, l, g in prs], 400)["p"] > 0.5
+    assert np.allclose(holm([0.01, 0.04, 0.03]), [0.03, 0.06, 0.06]) and abs(sign_test([-1] * 9 + [1])["p"] - 0.0215) < 1e-3
+    sb = HandwritingDataModule._select(1000, 205, 7, 20)
+    assert len(sb) == 205 and all(((sb // 20) == b).sum() in (20, 5) for b in set(sb // 20)) and np.array_equal(sb, HandwritingDataModule._select(1000, 205, 7, 20))
+    tmpd = tempfile.mkdtemp()
+    tx = [f"word{i} text" for i in range(40)]
+    for deco in (False, True):
+        cd_ = Config.smoke(tmpd)
+        cd_.data.labeled_fraction, cd_.data.decontaminate = 0.5, deco
+        dmd = HandwritingDataModule(cd_)
+        dmd._load_sources = lambda: [{"train": ListSource(tx, 1), "val": ListSource(tx[20:28], 9), "test": ListSource(tx[:8], 1)}]   # type: ignore
+        if not deco:
+            try:
+                dmd.prepare()
+                raise AssertionError("train/test image overlap must be an error without decontamination")
+            except RuntimeError:
+                pass
+        else:
+            dmd.prepare()
+            assert len(dmd.train_ds) == 32 and dmd.provenance["decontamination"]["removed_from_train"] == 8
+    import io as _io
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from .data import ParquetSource
+    rws = []
+    for k in range(25):
+        bb = _io.BytesIO()
+        Image.fromarray((np.random.RandomState(k).rand(20, 40 + k) * 255).astype(np.uint8)).save(bb, format="PNG")
+        rws.append({"image": {"bytes": bb.getvalue(), "path": None}, "text": f"line {k}"})
+    pq.write_table(pa.Table.from_pylist(rws), os.path.join(tmpd, "train.parquet"), row_group_size=7)
+    ps_ = ParquetSource([os.path.join(tmpd, "train.parquet")])
+    assert len(ps_) == 25 and ps_.text(13) == "line 13" and ps_.image(13).size == (53, 20) and ps_.image(24).size == (64, 20)
+    # memory-mapped line cache: built once (streamed to disk), re-read without decoding, subsets / concatenations copy no pixels,
+    # pickling (what a data-loader worker receives) carries no pixel data
+    import pickle as _pk
+    from .data import InkStore, _ink_concat, _ink_subset, build_line_cache, cached_line_cache
+    lcd, ckey_ = os.path.join(tmpd, "lines"), {"corpus": "t", "split": "train", "ink": True, "v": 2}
+    sel_ = np.arange(25)
+    c_a = cached_line_cache(lcd, ckey_, lambda p: build_line_cache(ps_, sel_, 32, 400, 16, 4, "t", True, p))
+    c_b = cached_line_cache(lcd, ckey_, lambda p: (_ for _ in ()).throw(AssertionError("a cached entry must not be rebuilt")))
+    ref_ = build_line_cache(ps_, sel_, 32, 400, 16, 4, "t", True, None)["ink"]
+    assert isinstance(c_b["ink"], InkStore) and all(np.array_equal(c_b["ink"][i], ref_[i]) for i in range(25))
+    assert c_a["digest"] == c_b["digest"] and np.array_equal(c_a["width"], c_b["width"])
+    mix_ = _ink_subset(_ink_concat([c_b["ink"], InkStore.from_arrays([ref_[3]])]), np.array([25, 7]))
+    assert np.array_equal(mix_[0], ref_[3]) and np.array_equal(mix_[1], ref_[7]) and len(_pk.dumps(c_b["ink"])) < 4096
+    # one DataLoader iterator per epoch (tqdm.auto's asyncio class used to start a second one, i.e. twice the workers)
+    from . import trainer as _tr
+    _n_it = {"n": 0}
+
+    class _CountIt:
+        def __iter__(self):
+            _n_it["n"] += 1
+            return iter(range(3))
+
+        def __len__(self):
+            return 3
+    assert list(_tr.tqdm(_CountIt(), disable=True)) == [0, 1, 2] and _n_it["n"] == 1
+    shutil.rmtree(tmpd, ignore_errors=True)
+    ok("experiment plan: budget rule (IAM = v10 defaults), corpus-major plan, pooled paired bootstrap / Holm / sign test, block caps, decontamination, parquet reader, memory-mapped line cache, one loader iterator")
     LOG.info("%d self-tests passed in %.1fs", len(done), time.time() - t0)
 
 

@@ -44,9 +44,12 @@ cfg = Config(); cfg.run.mode = "finetune"              # continue a trained chec
 cfg.train.init_from = "inklingua_runs/inklingua_iam/checkpoints/best.pt"; cfg.data.sources = ("esposalles",); main(cfg)
 ```
 
-**Kaggle (GPU T4 x2):** upload `notebooks/InkLingua_Kaggle_T4x2.ipynb`; it is self-contained (section 2 writes the package), puts the
-recogniser on `cuda:0` and the LLM on `cuda:1`, and resumes from `/kaggle/working` across sessions.  Regenerate it after changing the
-package with `python tools/build_kaggle_notebook.py`.
+**The article's experiments (Kaggle GPU T4 x2):** `notebooks/InkLingua_Kaggle_T4x2.ipynb` is one cell with one entry point.  It runs
+the complete experiment plan on the real corpora (5 core variants, 14 training ablations and a label-budget sweep, for every corpus and 3
+seeds; then a joint model and a zero-shot adaptation stage), two runs in parallel on the two T4s, and resumes in the next session.  It
+writes the paper tables (Markdown, LaTeX, CSV), figures, statistics and a reproducibility report.  See `docs/EXPERIMENT_PLAN.md`,
+including its cost: the full plan is about 2,350 T4 GPU-hours.  Regenerate the notebook after changing the package with
+`python tools/build_kaggle_notebook.py`.
 
 There is no argparse: every option is a dataclass default in `inklingua/config.py`.  Modes: `single`, `suite`,
 `suite_summary`, `finetune`, `adapt` / `adapt_curve` / `source_calib` (zero-shot adaptation to a folder of line images in a
@@ -70,7 +73,10 @@ new language), `report` (rebuild the report of an existing run), `smoke`.
 | `inklingua/adapt.py` | `finetune` on a labeled corpus; zero-shot adaptation ([ALPHA-SPLIT], [LEX-TIE], [XL-RC]) |
 | `inklingua/report.py` | the self-contained run report (`12_report/index.html`) |
 | `inklingua/suite.py` | baselines, ablations, seed-paired comparison, component-contribution table |
-| `inklingua/selftest.py` | 17 fast invariant tests (run before every real run) + the synthetic smoke |
+| `inklingua/experiments.py` | the article's experiment plan: corpus after corpus, GPU workers, resumable ledger, session deadline |
+| `inklingua/schedule.py` | the training-budget rule (epochs from corpus size, script and era; IAM = the v10 defaults) |
+| `inklingua/paper.py` | paper tables (md / tex / csv), figures, pooled paired bootstrap, Holm, sign test, reproducibility report |
+| `inklingua/selftest.py` | 18 fast invariant tests + the synthetic smoke (repository tests only; the notebook runs neither) |
 
 ## The protocol (why the numbers can be trusted)
 
@@ -93,7 +99,7 @@ licences of the underlying corpora are research-only in several cases: check `do
 
 ## Status and honesty
 
-* Verified here: 17 self-tests and the synthetic end-to-end smoke (train, resume, inference, report) on CPU.  Facts about the
+* Verified here: 18 self-tests, a real-IAM run of the experiment plan on CPU, and the synthetic end-to-end smoke (train, resume, inference, report) on CPU.  Facts about the
   datasets and the literature were checked online on 2026-11-04 (`docs/AUDIT_v10_to_v11.md`, section C).
 * **Unverified**: the real-IAM benefit of every component, including whether unlabeled data helps at all.  Run the suite.
 * The LLM translation evaluation has no human reference; the LLM's translation of the true text is the proxy.

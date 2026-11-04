@@ -31,7 +31,12 @@ from .text import cer, detokenize, edit_distance, grapheme_clusters
 from .utils import LOG, Meter, atomic_save, json_safe, to_device, torch_load
 
 try:
-    from tqdm.auto import tqdm
+    import warnings as _w
+    with _w.catch_warnings():
+        _w.simplefilter("ignore")
+        # not tqdm.auto: its asyncio class calls iter() in __init__, so a DataLoader started two iterators (twice the workers,
+        # one idle pair holding prefetched batches)
+        from tqdm.autonotebook import tqdm
 except Exception:  # pragma: no cover
     def tqdm(x, **kw):  # type: ignore
         return x
@@ -117,6 +122,7 @@ class Trainer:
         self.prev_val_preds: Optional[List[str]] = None
         self.prev_val_cer: Optional[np.ndarray] = None
         self.skipped = 0
+        self.interrupted, self.completed_epochs = False, 0
         # ---- FRAG-RC state: reliability model + one threshold per cell (re-fitted every `refresh_every` epochs)
         self.frag_state: Optional[Dict[str, Any]] = None
         self.frag_model: Optional[FragModel] = None
@@ -440,7 +446,12 @@ class Trainer:
             for ids, _lp in nb:
                 t = codec.decode_ids(ids)
                 raw.append(t), det.append(detokenize(ds.display(i, t)) if ds.detok(i) else ds.display(i, t))
-        lm_lp, n_tok = self.llm.score_texts(det)
+        langs = [ds.language(i) for i, nb in border for _ in nb]
+        lm_lp, n_tok = np.zeros(len(det)), np.zeros(len(det))
+        for lang in sorted(set(langs)):
+            ix = [k for k, l in enumerate(langs) if l == lang]
+            a, b = self.llm.score_texts([det[k] for k in ix], lang)
+            lm_lp[ix], n_tok[ix] = a, b
         pos, changed, agreed = 0, 0, 0
         for i, nb in border:
             K = len(nb)
@@ -697,7 +708,16 @@ class Trainer:
                  str(self.amp_dtype).replace("torch.", ""), len(data.labeled_idx), len(data.calib_idx), len(data.unlabeled_idx), data.domain_names)
         n_unl = len(data.unlabeled_idx)
         nan = float("nan")
+        self.completed_epochs = self.start_epoch
+        epoch_secs: List[float] = []
         for epoch in range(self.start_epoch, tc.epochs):
+            if tc.deadline_unix > 0:
+                need = (np.median(epoch_secs) if epoch_secs else 0.0) * 1.15
+                if time.time() + need > tc.deadline_unix:
+                    self.interrupted = True
+                    LOG.warning("[DEADLINE] stopping before epoch %d (expected %.0fs, %.0fs left); last.pt holds epoch %d", epoch + 1, need,
+                                tc.deadline_unix - time.time(), epoch)
+                    return
             t0, rec = time.time(), {}
             if pc.enabled and n_unl > 0 and epoch >= pc.warmup_epochs and (epoch - pc.warmup_epochs) % pc.refresh_every == 0:
                 rec.update(self.refresh_pseudo_labels(epoch))
@@ -766,8 +786,29 @@ class Trainer:
                      ev["cer"], ev_ema["cer"], sel_st, rec["val_gate_cer"], ev["wer"], ev_tr["cer"], ev["style_mae"], ev.get("style_acc", nan),
                      g("ppl_low", nan), g("ppl_high", nan), self._lr(self.global_step), self.best_cer, self.best_from, self.best_epoch,
                      f" | skipped steps {self.skipped}" if self.skipped else "")
+            epoch_secs.append(time.time() - t0)
+            self.completed_epochs = epoch + 1
             if stop:
                 LOG.info("EARLY STOP at epoch %d: no val_sel-CER gain >= %.4f for %d epochs (best %.4f at epoch %d).", epoch + 1, tc.min_delta, tc.patience,
                          self.best_cer, self.best_epoch)
                 break
         LOG.info("Training done. Best val_sel CER %.4f (%s, epoch %d). Curves: %s", self.best_cer, self.best_from, self.best_epoch, cfg.curve_dir)
+        self._final_source_calibration()
+
+    def _final_source_calibration(self) -> None:
+        """checkpoints/source_calibration.npz from the BEST weights when training used FRAG-RC (the legacy path writes it at every refresh): the
+        source side of the zero-shot adapter's transfer-calibrated risk control.  Without it the adapter could not select pseudo-labels."""
+        p = os.path.join(self.cfg.ckpt_dir, "source_calibration.npz")
+        if os.path.exists(p) or len(self.data.calib_idx) < 20 or not os.path.exists(self.best_path) or not self.pc.save_source_calibration:
+            return
+        try:
+            st = torch_load(self.best_path)
+            self.ema.module.load_state_dict(st["weights"])
+            rc = self._teacher_read(self.data.calib_idx, desc="source calibration lines")
+            ref = [self.data.train_ds.reference(i) for i in rc["idx"]]
+            ed = np.array([edit_distance(a, b) for a, b in zip(ref, rc["text"])], np.float64)
+            rl = np.array([len(a) for a in ref], np.float64)
+            self._save_source_calibration(rc["X"], ed, rl, int(st.get("epoch", -1)))
+            LOG.info("source calibration written (%d calibration lines, CER %.4f)", len(ed), ed.sum() / max(rl.sum(), 1))
+        except Exception:
+            LOG.exception("could not write source_calibration.npz")
