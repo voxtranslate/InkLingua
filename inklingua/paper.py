@@ -387,20 +387,28 @@ def build_paper(plan, runs: Sequence[Dict[str, Any]], state: Dict[str, Dict[str,
                                  "Seed 1 only.  'language prior' = [LEX-TIE] resolution of the tied accent variants with the LLM of the written language."))
 
     # ---- T8 translation, T9 uncertainty (full profile runs)
-    t8, t9 = [], []
+    def _fx(v: Any, spec: str) -> str:
+        """A number for a table cell, '-' when it is missing or undefined (e.g. an AUROC on a set where every line is wrong)."""
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return "-"
+        return format(v, spec) if np.isfinite(v) else "-"
+
+    t8, t9_raw = [], []
     for c in corpora + (["joint"] if plan.joint else []):
         rs = [r for r in sel(c, "full", main_lf) if r["profile"] == "full"]
         for r in rs:
             tr = r.get("translation") or {}
             if tr.get("n_random"):
                 d = tr.get("chrf_uncertain_minus_plain_same_prompt_oracles") or {}
-                t8.append([c, str(tr["n_random"]), f"{tr.get('chrf_plain_vs_oracle', float('nan')):.1f}",
-                           f"{tr.get('chrf_uncertain_vs_oracle_same_prompt', float('nan')):.1f}",
-                           f"{d.get('delta', float('nan')):+.1f} [{d.get('lo', float('nan')):+.1f}, {d.get('hi', float('nan')):+.1f}]"])
+                t8.append([c, str(tr["n_random"]), _fx(tr.get("chrf_plain_vs_oracle"), ".1f"), _fx(tr.get("chrf_uncertain_vs_oracle_same_prompt"), ".1f"),
+                           f"{_fx(d.get('delta'), '+.1f')} [{_fx(d.get('lo'), '+.1f')}, {_fx(d.get('hi'), '+.1f')}]"])
             u = (r.get("interpret") or {}).get("signals") or {}
             if u:
-                t9.append([c] + [f"{(u.get(k) or {}).get('auroc_line_has_error', float('nan')):.3f}" for k in sorted(u)])
-                sig_names = sorted(u)
+                t9_raw.append((c, u))
+    sig_names = sorted({k for _, u in t9_raw for k in u})            # one column per signal, aligned across corpora
+    t9 = [[c] + [_fx((u.get(k) or {}).get("auroc_line_has_error"), ".3f") for k in sig_names] for c, u in t9_raw]
     if t8:
         docs.append(_write_table(out, "T8_translation", "Translation of the reading (chrF against the translation of the true text; seed 1)",
                                  ["corpus", "lines", "plain prompt", "uncertainty prompt", "Δ (95 % CI)"], t8,
@@ -414,9 +422,12 @@ def build_paper(plan, runs: Sequence[Dict[str, Any]], state: Dict[str, Dict[str,
         rs = [r for r in rows if r["stage"] == c]
         if not rs:
             continue
-        t10.append([c, str(rs[0].get("epochs_planned")), f"{np.mean([r['epochs_trained'] for r in rs]):.0f}",
-                    f"{np.mean([r['best_epoch'] or 0 for r in rs]):.0f}", f"{rs[0].get('complexity') or 0:.2f}", str(len(rs)),
-                    f"{np.mean([r['gpu_hours'] for r in rs]):.2f}", f"{sum(r['gpu_hours'] for r in rs):.1f}"])
+        def _mean(key: str) -> float:
+            v = [float(r[key]) for r in rs if r.get(key) is not None]
+            return float(np.mean(v)) if v else float("nan")
+        t10.append([c, _fx(rs[0].get("epochs_planned"), ".0f"), _fx(_mean("epochs_trained"), ".0f"), _fx(_mean("best_epoch"), ".0f"),
+                    _fx(rs[0].get("complexity"), ".2f"), str(len(rs)), _fx(_mean("gpu_hours"), ".2f"),
+                    _fx(sum(float(r.get("gpu_hours") or 0.0) for r in rs), ".1f")])
     if t10:
         docs.append(_write_table(out, "T10_compute", "Training budget and compute (NVIDIA T4)", ["stage", "epoch budget", "epochs trained (mean)",
                                  "best epoch (mean)", "complexity", "finished runs", "GPU-h per run", "GPU-h total"], t10,
