@@ -1,0 +1,40 @@
+# Changelog
+
+## v11.0.0 (2026-11-04) -- restructuring, audit fixes, multi-corpus, interpretability suite
+
+Structure
+* The v10 single file (~6,000 lines) is now the `inklingua/` package: one module per question (see `inklingua/__init__.py`), a
+  thin `inklingua.py` entry point, `tests/` wrappers for pytest.  Behaviour is the v10 behaviour except for the fixes below.
+
+Fixed (full list with locations in `docs/AUDIT_v10_to_v11.md`)
+* The self-tests no longer contain a synthetic training run; the real run's log handlers are no longer redirected into a deleted
+  temporary directory.  The smoke is `mode="smoke"` / `tests/test_smoke.py`.
+* The suite runs the self-tests once instead of once per variant x seed.
+* `KeyError` after an epoch in which every step was skipped.
+* Out-of-range cell index when a FRAG-RC rule meets data with more cells (clipped; strata cuts stored in `best.pt`).
+* Alphabet units are grapheme clusters (combining marks stay attached); checkpoints store `units`.
+* Character classes use Unicode categories (uncased scripts were counted as punctuation).
+* IAM detokenisation only for corpora flagged `detokenize=True`.
+* The primary translation column follows the configured prompt; arms are named.
+* Dead computation removed (`style_pred` in `Trainer.evaluate`); style attention is now shown instead of being discarded.
+* Training curves gained FRAG-RC panels (trusted share, per-cell coverage, realised error of trusted characters).
+* The suite summary reports WER, post-hoc and system CER, a component-contribution table, and can re-aggregate without retraining.
+
+Added
+* `DatasetSpec` + a registry of 12 verified free line-level corpora; multi-corpus training with per-corpus metrics, per-corpus
+  FRAG-RC cells (`strata_per_domain`) and `domain_balance`.
+* Right-to-left support (`DatasetSpec.rtl`, `AdaptConfig.rtl`): visual order inside, logical order outside.
+* `mode="finetune"` / `TrainConfig.init_from`: warm start from any checkpoint with function-preserving alphabet growth.
+* Interpretability suite (`inklingua/interpret.py`): layer probes, uncertainty decomposition, character counterfactuals, style
+  neighbours, alignment export, long-line stress test, group tables.
+* Structured output folders (`docs/INFERENCE_OUTPUTS.md`); the report shows per-corpus tables and the interpretability results.
+* Suite presets `quick` / `paper` / `all`; ablations `no_strata`, `no_sharpen`.
+* Literature update in the FRAG-RC docstring and the audit (DocTTT, MetaWriter, few-shot ICL writer adaptation, Geometric Risk
+  Control for VLM OCR, Selective Conformal Risk Control, OT pseudo-label selection, Learning Beyond Labels).
+
+Unchanged on purpose
+* Default hyper-parameters, the 2 % character-error target and z = 2 of FRAG-RC, the style descriptors, the LLM evaluation proxy.
+
+## v10 and earlier
+The history of v2 -> v10 (what each IAM run showed and what the next version did about it) is preserved in the original
+single-file header; the essentials are summarised in `docs/AUDIT_v10_to_v11.md` and in the module docstrings.
