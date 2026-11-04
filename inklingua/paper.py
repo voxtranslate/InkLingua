@@ -255,7 +255,7 @@ def build_paper(plan, runs: Sequence[Dict[str, Any]], state: Dict[str, Dict[str,
     docs.append(_write_table(out, "T2_main_claim", "Does the unlabeled data help? CER difference (points), InkLingua minus baseline",
                              ["corpus", "seeds", "Δ vs labeled only", "p (Holm)", "Δ vs line-level PL", "p (Holm)"], t2,
                              f"Negative = InkLingua is better.  Across all (corpus, seed) pairs: InkLingua better in {st['better']} of {st['n']} "
-                             f"(exact sign test p = {st['p']:.3g}).  labeled_only also trains on the 10 % of the label budget that InkLingua holds out for calibration."))
+                             f"(exact sign test p = {(format(st['p'], '.3g') if st['n'] and np.isfinite(st['p']) else '-')}).  labeled_only also trains on the 10 % of the label budget that InkLingua holds out for calibration."))
 
     # ---- T3 ablations
     abl_corpora = [c for c in corpora if (not plan.ablation_corpora or c in plan.ablation_corpora)]
