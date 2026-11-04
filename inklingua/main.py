@@ -10,7 +10,7 @@ from .llm import LLMEngine
 from .model import InkLinguaNet
 from .protocol import write_protocol
 from .style import NUM_DESC
-from .utils import LOG, resolve_device, set_seed, setup_logging
+from .utils import LOG, resolve_device, resolve_llm_device, set_seed, setup_logging
 
 
 def run_single(cfg: Config, base_units: Optional[Sequence[str]] = None) -> Optional[Dict[str, Any]]:
@@ -32,7 +32,9 @@ def run_single(cfg: Config, base_units: Optional[Sequence[str]] = None) -> Optio
     if not cfg.llm.source_language:
         cfg.llm.source_language = data.primary_language
     write_protocol(cfg, data)
-    llm = LLMEngine(cfg.llm, device)
+    llm_device = resolve_llm_device(cfg.llm.device, device)
+    LOG.info("recogniser on %s, LLM on %s", device, llm_device)
+    llm = LLMEngine(cfg.llm, llm_device)
     model = InkLinguaNet(cfg.model, data.codec.num_classes, NUM_DESC, data.n_clusters, cfg.data.img_height)
     best, metrics = None, None
     if cfg.run.do_train:

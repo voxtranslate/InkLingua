@@ -88,6 +88,16 @@ def resolve_device(name: str) -> torch.device:
     return torch.device(name)
 
 
+def resolve_llm_device(name: str, main_device: torch.device) -> torch.device:
+    """Device of the LLM: "auto" puts it on the second GPU when two are available (the recogniser keeps the first), else next to the recogniser."""
+    if name == "auto":
+        if main_device.type == "cuda" and torch.cuda.device_count() > 1:
+            other = 1 if (main_device.index or 0) == 0 else 0
+            return torch.device(f"cuda:{other}")
+        return main_device
+    return torch.device(name)
+
+
 def atomic_save(obj: Any, path: str) -> None:
     tmp = path + ".tmp"
     torch.save(obj, tmp)

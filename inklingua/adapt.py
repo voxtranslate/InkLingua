@@ -39,7 +39,7 @@ from .pseudo import PERTURBATIONS, RELIABILITY_FEATURES, SelectionRule, apply_pe
 from .riskcontrol import transfer_risk_control
 from .style import NUM_DESC
 from .text import CharCodec, cer, ctc_min_frames, edit_distance, grapheme_clusters, normalize_text, to_logical, to_visual
-from .utils import LOG, atomic_save, json_safe, resolve_device, set_seed, setup_logging, torch_load
+from .utils import LOG, atomic_save, json_safe, resolve_device, resolve_llm_device, set_seed, setup_logging, torch_load
 
 IMAGE_EXT = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp")
 
@@ -479,7 +479,7 @@ def run_adapt(cfg: Optional[Config] = None) -> Dict[str, Any]:
     set_seed(cfg.run.seed)
     device = resolve_device(cfg.run.device)
     LOG.info("InkLingua v%s | zero-shot adaptation | device %s", __version__, device)
-    llm = LLMEngine(cfg.llm, device)
+    llm = LLMEngine(cfg.llm, resolve_llm_device(cfg.llm.device, device))
     return ZeroShotAdapter(cfg, device, llm).run()
 
 
@@ -489,7 +489,7 @@ def run_adapt_curve(cfg: Optional[Config] = None) -> Dict[str, Any]:
     cfg.make_dirs()
     setup_logging(cfg)
     device = resolve_device(cfg.run.device)
-    llm = LLMEngine(cfg.llm, device)
+    llm = LLMEngine(cfg.llm, resolve_llm_device(cfg.llm.device, device))
     curve = {}
     for k in cfg.adapt.anchor_counts:
         c = copy.deepcopy(cfg)

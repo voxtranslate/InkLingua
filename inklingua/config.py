@@ -278,6 +278,8 @@ class TrainConfig:
 @dataclass
 class LLMConfig:
     backend: str = "causal"                    # "causal" | "seq2seq" | "dummy"
+    device: str = "auto"                       # "auto" = the SECOND GPU when there are two (Kaggle T4 x2: recogniser on cuda:0, LLM on cuda:1),
+                                               # otherwise the recogniser's device; or an explicit "cuda:1" / "cpu"
     model_name: str = "Qwen/Qwen2.5-1.5B-Instruct"
     seq2seq_models: Dict[str, str] = field(default_factory=lambda: {
         "fr": "Helsinki-NLP/opus-mt-en-fr", "es": "Helsinki-NLP/opus-mt-en-es",

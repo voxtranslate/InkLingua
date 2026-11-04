@@ -44,6 +44,10 @@ cfg = Config(); cfg.run.mode = "finetune"              # continue a trained chec
 cfg.train.init_from = "inklingua_runs/inklingua_iam/checkpoints/best.pt"; cfg.data.sources = ("esposalles",); main(cfg)
 ```
 
+**Kaggle (GPU T4 x2):** upload `notebooks/InkLingua_Kaggle_T4x2.ipynb`; it is self-contained (section 2 writes the package), puts the
+recogniser on `cuda:0` and the LLM on `cuda:1`, and resumes from `/kaggle/working` across sessions.  Regenerate it after changing the
+package with `python tools/build_kaggle_notebook.py`.
+
 There is no argparse: every option is a dataclass default in `inklingua/config.py`.  Modes: `single`, `suite`,
 `suite_summary`, `finetune`, `adapt` / `adapt_curve` / `source_calib` (zero-shot adaptation to a folder of line images in a
 new language), `report` (rebuild the report of an existing run), `smoke`.
