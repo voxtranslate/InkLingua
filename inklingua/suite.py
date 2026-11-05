@@ -141,7 +141,7 @@ def run_suite(cfg: Optional[Config] = None, train: bool = True) -> Dict[str, Any
             c.run.mode = "single"
             p = _member_pred_path(c)
             if train:
-                LOG.info("=== suite: variant '%s', seed %d  (%s)", v, s, c.run.name)
+                LOG.info("=== suite: variant '%s', seed %d  (%s)", v, s, c.run_name)
                 m = main(c)
                 if m is None or not os.path.exists(p):
                     continue
@@ -149,7 +149,7 @@ def run_suite(cfg: Optional[Config] = None, train: bool = True) -> Dict[str, Any
                 LOG.warning("suite_summary: no predictions for variant '%s' seed %d (%s)", v, s, p)
                 continue
             runs.setdefault(v, {})[s] = p
-    out_dir = os.path.join(cfg.run.work_dir, f"{cfg.run.name}_suite")
+    out_dir = os.path.join(cfg.run.work_dir, f"{cfg.run_name}_suite")
     os.makedirs(out_dir, exist_ok=True)
     baseline = "labeled_only" if "labeled_only" in runs else next(iter(runs), "labeled_only")
     summ = summarise_suite(runs, baseline, cfg.infer.bootstrap, cfg.infer.bootstrap_block)
@@ -178,7 +178,7 @@ def run_seeds(cfg: Optional[Config] = None, seeds=(1337, 1338, 1339)) -> Dict[st
         v = np.array([r[k] for r in rows], np.float64)
         if len(v):
             summ[k] = {"mean": float(v.mean()), "std": float(v.std(ddof=1)) if len(v) > 1 else float("nan")}
-    path = os.path.join(cfg.run.work_dir, f"{cfg.run.name}_seeds.json")
+    path = os.path.join(cfg.run.work_dir, f"{cfg.run_name}_seeds.json")
     os.makedirs(cfg.run.work_dir, exist_ok=True)
     with open(path, "w") as f:
         json.dump(json_safe(summ), f, indent=2, allow_nan=False)

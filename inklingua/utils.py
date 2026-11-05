@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import warnings
 import random
 import sys
 from collections import defaultdict
@@ -64,6 +65,57 @@ def setup_logging(cfg, replace: bool = True) -> None:
     LOG.addHandler(sh)
     LOG.addHandler(fh)
     LOG.propagate = False
+    quiet_third_party()
+
+
+_NOISY_LOGGERS = ("httpx", "httpx2", "httpcore", "httpcore2", "urllib3", "requests", "filelock", "fsspec", "huggingface_hub", "datasets", "transformers", "accelerate",
+                  "PIL", "matplotlib", "h5py", "numexpr")
+_HUB_READY = {"done": False}
+
+
+def quiet_third_party() -> None:
+    """Keep the experiment log about the experiment: no per-request HTTP lines (httpx logs every HEAD / GET at INFO, and a notebook
+    that configured the root logger at INFO printed them all), no download progress bars, no telemetry, and the Hugging Face token
+    resolved once (see `resolve_hf_token`) instead of a warning repeated by every library that talks to the Hub."""
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+    os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+    os.environ.setdefault("HF_DATASETS_DISABLE_PROGRESS_BARS", "1")
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    warnings.filterwarnings("ignore", message=".*unauthenticated requests to the HF Hub.*")
+    try:
+        from huggingface_hub.utils import disable_progress_bars
+        disable_progress_bars()
+    except Exception:
+        pass
+    try:
+        import datasets as _hfd
+        _hfd.utils.logging.set_verbosity_warning()
+        _hfd.utils.logging.disable_progress_bar()
+    except Exception:
+        pass
+    for name in _NOISY_LOGGERS:                                         # after the imports: huggingface_hub resets its level on import
+        logging.getLogger(name).setLevel(logging.WARNING)
+    logging.getLogger("huggingface_hub").setLevel(logging.ERROR)        # its token hint is logged once below, as an INFO line
+    if not _HUB_READY["done"]:
+        _HUB_READY["done"] = True
+        how = resolve_hf_token()
+        LOG.info("Hugging Face Hub: %s", how)
+
+
+def resolve_hf_token() -> str:
+    """HF_TOKEN from the environment, else from a Kaggle secret named HF_TOKEN (Add-ons -> Secrets), exported for every library and
+    subprocess.  Without a token the public corpora still download (lower rate limits)."""
+    if os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN"):
+        return "authenticated (HF_TOKEN from the environment)"
+    try:
+        from kaggle_secrets import UserSecretsClient          # only exists on Kaggle
+        tok = UserSecretsClient().get_secret("HF_TOKEN")
+        if tok:
+            os.environ["HF_TOKEN"] = tok
+            return "authenticated (Kaggle secret HF_TOKEN)"
+    except Exception:
+        pass
+    return "unauthenticated (public datasets only; set HF_TOKEN, or add a Kaggle secret named HF_TOKEN, for higher rate limits)"
 
 
 def restore_logging() -> None:

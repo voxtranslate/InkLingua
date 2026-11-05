@@ -57,6 +57,9 @@ EVAL_RESERVE_MIN = {"full": 100, "standard": 40, "core": 15}
 PRIOR_SEC_PER_STEP = 0.15          # T4 prior for the default model (replaced by measured rates as soon as runs finish)
 
 
+OUTPUT_LIMIT_GB = 18.5                                                # Kaggle saves at most 20 GB of /kaggle/working
+
+
 @dataclass
 class PlanConfig:
     work_dir: str = "/kaggle/working/inklingua_runs"
@@ -88,6 +91,10 @@ class PlanConfig:
     max_attempts: int = 3
     keep_checkpoints: str = "core"                                # "core" | "all" | "none" (best.pt after evaluation)
     cleanup_caches: bool = True
+    persist_cache_gb: float = 8.0                                 # at the end of a session, the line caches (preprocessed lines + manifests) of
+                                                                  # the corpora that still have pending runs are saved in the output
+                                                                  # (<work_dir>/_cache/lines) up to this size, and restored by the next session:
+                                                                  # a corpus that spans several sessions is downloaded and decoded once
     resume_from: str = ""                                         # previous output folder (Kaggle: /kaggle/input/<previous version>)
 
     @property
@@ -411,6 +418,39 @@ class PlanRunner:
                 except OSError:
                     pass
 
+    def persist_caches(self) -> None:
+        """Copy the line-cache entries of the corpora that still have pending runs into the saved output (in plan order, within
+        plan.persist_cache_gb); entries of finished corpora are removed from it."""
+        src, dst = os.path.join(self.plan.cache_dir, "lines"), os.path.join(self.plan.work_dir, "_cache", "lines")
+        if self.plan.persist_cache_gb <= 0 or not os.path.isdir(src):
+            shutil.rmtree(dst, ignore_errors=True)
+            return
+        with self.ledger.lock:
+            pending = [r for r in self.runs if self.ledger.get(r["id"])["status"] not in ("done", "skipped")]
+        order = list(dict.fromkeys(k for r in pending for k in r["sources"]))
+        used = sum(os.path.getsize(os.path.join(r_, f)) for r_, _d, fs in os.walk(self.plan.work_dir) if "_cache" not in r_.split(os.sep)
+                   for f in fs if os.path.isfile(os.path.join(r_, f)))
+        budget, chosen = min(self.plan.persist_cache_gb * 1e9, OUTPUT_LIMIT_GB * 1e9 - used), []     # the saved output must stay < 20 GB
+        for key in order:
+            files = [f for f in glob.glob(os.path.join(src, f"{key}_*")) if not f.endswith((".lock", ".tmp"))]
+            size = sum(os.path.getsize(f) for f in files)
+            if size > budget:
+                self.log(f"line cache of '{key}' ({size / 1e9:.1f} GB) does not fit the {self.plan.persist_cache_gb:.0f} GB left: it will be rebuilt")
+                break
+            budget -= size
+            chosen += files
+        keep = {os.path.basename(f) for f in chosen}
+        os.makedirs(dst, exist_ok=True)
+        for f in os.listdir(dst):
+            if f not in keep:
+                os.remove(os.path.join(dst, f))
+        for f in chosen:
+            b = os.path.join(dst, os.path.basename(f))
+            if not os.path.exists(b) or os.path.getsize(b) != os.path.getsize(f):
+                shutil.copy2(f, b)
+        if chosen:
+            self.log(f"line caches saved for the next session: {len(chosen)} files, {sum(os.path.getsize(f) for f in chosen) / 1e9:.1f} GB")
+
     # ---------------------------------------------------------------- reporting
     def progress(self) -> str:
         c: Dict[str, int] = {}
@@ -461,6 +501,7 @@ class PlanRunner:
         for th in threads:
             th.join()
         self.refresh_paper()
+        self.persist_caches()
         self.log("session finished | " + self.progress())
         return {"progress": self.progress(), "paper": os.path.join(self.plan.work_dir, "paper")}
 
@@ -479,6 +520,8 @@ def restore_previous(src: str, dst: str, log=print) -> int:
     n = 0
     for root, _dirs, files in os.walk(src):
         rel = os.path.relpath(root, src)
+        if rel.split(os.sep)[0] == "_cache":          # saved line caches go straight back to the cache folder (see run_plan)
+            continue
         for fn in files:
             a, b = os.path.join(root, fn), os.path.join(dst, rel, fn)
             if not os.path.exists(b) or (fn == "state.json" and os.path.getmtime(a) > os.path.getmtime(b)):
@@ -489,10 +532,33 @@ def restore_previous(src: str, dst: str, log=print) -> int:
     return n
 
 
+def restore_caches(plan: PlanConfig, log=print) -> int:
+    """Line caches saved by the previous session (in its output, or already in this work dir) -> the cache folder of this session."""
+    dst = os.path.join(plan.cache_dir, "lines")
+    found = []
+    for base in ([plan.resume_from, os.path.join(plan.resume_from, os.path.basename(os.path.normpath(plan.work_dir)))] if plan.resume_from else []) \
+            + [plan.work_dir]:
+        d = os.path.join(base, "_cache", "lines")
+        if os.path.isdir(d):
+            found += [os.path.join(d, f) for f in os.listdir(d) if not f.endswith((".lock", ".tmp"))]
+    n = 0
+    os.makedirs(dst, exist_ok=True)
+    for f in found:
+        b = os.path.join(dst, os.path.basename(f))
+        if not os.path.exists(b):
+            shutil.copy2(f, b + ".tmp")
+            os.replace(b + ".tmp", b)
+            n += 1
+    if n:
+        log(f"restored {n} line-cache files from the previous session (no download / decoding for those corpora)")
+    return n
+
+
 def run_plan(plan: PlanConfig, code_root: Optional[str] = None, log=print) -> Dict[str, Any]:
     os.makedirs(plan.work_dir, exist_ok=True)
     os.makedirs(plan.cache_dir, exist_ok=True)
     restore_previous(plan.resume_from, plan.work_dir, log)
+    restore_caches(plan, log)
     code_root = code_root or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     os.makedirs(plan.plan_dir, exist_ok=True)
     runner = PlanRunner(plan, code_root, log)

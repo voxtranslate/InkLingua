@@ -60,13 +60,14 @@ class DatasetSpec:
 # ==============================================================================
 @dataclass
 class RunConfig:
-    name: str = "inklingua_iam"
+    name: str = ""                             # "" = derived from the corpora: "inklingua_<key>[_<key>...]" (see Config.run_name)
     work_dir: str = field(default_factory=_default_work_dir)   # checkpoints, curves, inference outputs
     seed: int = 1337
     device: str = "auto"                       # "auto" | "cpu" | "cuda" | "cuda:1"
     do_train: bool = True
     do_infer: bool = True
-    self_test: bool = True                     # run the fast invariant tests (inklingua.selftest.run_self_tests) before anything else
+    self_test: bool = False                    # True: run the fast invariant tests before anything else.  Off for real runs: the tests use
+                                               # synthetic data and belong to the repository (pytest / mode="smoke"), not to an experiment log
     smoke_test: bool = False                   # True ONLY for Config.smoke(): permits synthetic data, stamps outputs
     log_level: str = "INFO"
     # "single"        train + evaluate this configuration
@@ -95,7 +96,10 @@ class DataConfig:
     max_img_width: int = 2560                  # Teklia lines are up to ~5000 px wide at 128 px height
     min_img_width: int = 32
     pad_x: int = 8                             # blank margin (px) left/right of every line (keeps augmentations from cropping ink)
-    max_text_len: int = 90                     # applied to LABELED lines only (IAM-line maximum is 80)
+    max_text_len: Optional[int] = None         # optional cap on LABELED transcriptions; None = no cap (every line whose image has enough
+                                               # CTC frames is kept: a fixed cap of 90 silently dropped 76 KHATT / RIMES lines)
+    crop_ink_band: bool = True                 # cut images that are mostly blank page to their main text band before resizing (KHATT); tight
+                                               # line crops (IAM, RIMES) are unchanged -- see data.ink_band
     labeled_fraction: float = 0.30             # fraction of the train lines whose text is used (the annotation budget)
     calib_fraction: float = 0.10               # share of that budget HELD OUT (never trained on) to calibrate the trust rule of FRAG-RC /
                                                # the legacy pseudo-label selection; 0 = none (FRAG-RC then has no rule)
@@ -118,7 +122,11 @@ class DataConfig:
     subset_seed: int = 20261104                # seed of every line cap (DatasetSpec.max_lines, limit_*): FIXED across runs, so that all variants and
                                                # seeds see the same capped pool (the run seed only decides which lines are labeled)
     cap_block: int = 20                        # caps keep whole blocks of this many consecutive lines (form / page structure survives the cap)
-    line_cache_dir: Optional[str] = None       # on-disk cache of the preprocessed lines, shared by all runs of a corpus (None = off)
+    line_cache_dir: Optional[str] = "auto"     # on-disk cache of the preprocessed lines + split sizes + transcriptions, shared by every run of a
+                                               # corpus: a hit needs neither the download nor the decoding.  "auto" = <work_dir>/cache/lines;
+                                               # None / "" = off
+    line_cache_readonly: Tuple[str, ...] = ()  # further cache folders searched first, read-only (e.g. a Kaggle dataset made from a cache)
+    decode_workers: int = 0                    # processes that decode / preprocess images on a cache miss; 0 = all CPUs (at most 8)
     decontaminate: bool = False                # remove train lines whose image also occurs in validation / test, and validation lines that occur in
                                                # test (counted in provenance.json); False = such overlap is an error (strict_checks)
     synthetic_sizes: Tuple[int, int, int] = (600, 120, 120)
@@ -282,8 +290,11 @@ class TrainConfig:
     init_lr_scale: float = 0.5                 # peak lr relative to cfg.train.lr when starting from init_from
     init_strict_alphabet: bool = False         # False: the alphabet may GROW (new characters appended as tied copies, [ALPHA-SPLIT])
     # --- training budget ----------------------------------------------------------------------------------------------------------
-    auto_schedule: bool = False                # True: epochs, warm-ups, patience, refresh intervals ... from the data (inklingua/schedule.py)
-    deadline_unix: float = 0.0                 # > 0: stop at the end of the last epoch that fits before this time (resumable); 0 = no deadline
+    auto_schedule: bool = True                 # epochs, warm-ups, patience, refresh intervals ... from the size, script and era of the training
+                                               # data (inklingua/schedule.py; IAM = the v10 defaults).  False = use the values set here as they are
+    deadline_unix: float = 0.0                 # > 0: stop (with a resumable step checkpoint) before this time; 0 = no deadline
+    ckpt_every_minutes: float = 10.0           # step checkpoint (last.pt, mid-epoch included) at least this often: a run killed at any point
+                                               # resumes at the step where it stopped, with the same data order and random state
 
 
 @dataclass
@@ -423,7 +434,17 @@ class Config:
     # ---- derived paths -------------------------------------------------------
     @property
     def run_dir(self) -> str:
-        return os.path.join(self.run.work_dir, self.run.name)
+        return os.path.join(self.run.work_dir, self.run_name)
+
+    @property
+    def run_name(self) -> str:
+        """cfg.run.name, or "inklingua_<corpus>[_<corpus>...]" when it is empty (a multi-corpus run is never named after its first corpus)."""
+        return self.run.name or "inklingua_" + "_".join(self.data.sources)
+
+    @property
+    def line_cache_path(self) -> Optional[str]:
+        d = self.data.line_cache_dir
+        return os.path.join(self.run.work_dir, "cache", "lines") if d == "auto" else (d or None)
 
     @property
     def ckpt_dir(self) -> str:
@@ -462,7 +483,7 @@ class Config:
     def with_seed(self, seed: int) -> "Config":
         c = copy.deepcopy(self)
         c.run.seed = seed
-        c.run.name = f"{self.run.name}_s{seed}"
+        c.run.name = f"{self.run_name}_s{seed}"
         return c
 
     @classmethod
@@ -489,7 +510,7 @@ class Config:
         """THE baseline: identical model, augmentation (incl. MixLine) and labeled lines, but the unlabeled lines are never used
         (no pseudo-labels, no FRAG-RC, no calibration split -- it even trains on the lines `full` holds out for calibration)."""
         c = copy.deepcopy(base) if base is not None else cls()
-        c.run.name = f"{c.run.name}_labeled_only"
+        c.run.name = f"{c.run_name}_labeled_only"
         c.train.pseudo.enabled = c.train.frag.enabled = False
         c.data.calib_fraction = 0.0
         return c
@@ -500,13 +521,13 @@ class Config:
         b = base if base is not None else cls()
         if name == "full":
             c = copy.deepcopy(b)
-            c.run.name = f"{c.run.name}_full"
+            c.run.name = f"{c.run_name}_full"
             return c
         if name == "labeled_only":
             return cls.labeled_only(b)
         if name == "full_supervised":
             c = copy.deepcopy(b)
-            c.run.name = f"{c.run.name}_full_supervised"
+            c.run.name = f"{c.run_name}_full_supervised"
             c.data.labeled_fraction, c.data.calib_fraction = 1.0, 0.0
             c.train.pseudo.enabled = c.train.frag.enabled = False
             return c
@@ -525,7 +546,7 @@ class Config:
           (= no leakage penalty / decorrelation), no_frame_cons, no_hscale, no_calibration, no_mask, no_aux_ctc, no_shadow,
           no_risk_smoothing, no_v9_reg (no layer drop / CTC label smoothing), no_posthoc, ctc_only (plain CTC Transformer)."""
         c = copy.deepcopy(base) if base is not None else cls()
-        c.run.name = f"{c.run.name}_abl_{kind}"
+        c.run.name = f"{c.run_name}_abl_{kind}"
         L, P, Fg = c.train.loss, c.train.pseudo, c.train.frag
         if kind == "no_pseudo":
             P.enabled = Fg.enabled = False
@@ -591,6 +612,8 @@ class Config:
         outputs are stamped as such."""
         c = cls()
         c.run.name, c.run.work_dir, c.run.smoke_test = "smoke", work_dir, True
+        c.train.auto_schedule = False
+        c.data.line_cache_dir = None
         c.data.source, c.data.sources = "synthetic", ("synthetic",)
         c.data.img_height, c.data.max_img_width, c.data.pad_x = 32, 512, 4
         c.data.batch_size, c.data.eval_batch_size, c.data.num_workers = 16, 16, 0
