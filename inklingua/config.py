@@ -276,6 +276,7 @@ class TrainConfig:
     restart_warmup_steps: int = 200
     leak_queue: int = 1024
     leak_ridge: float = 0.3
+    leak_refit_every: int = 10                 # steps between two (CPU, float64) refits of the leakage probe
     leak_slack: float = 0.02
     save_every: int = 5
     keep_last: int = 3

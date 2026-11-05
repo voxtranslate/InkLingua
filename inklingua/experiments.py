@@ -31,6 +31,7 @@ import copy
 import dataclasses
 import glob
 import json
+import logging
 import math
 import os
 import shutil
@@ -272,7 +273,7 @@ def tail(path: str, n: int = 25) -> str:
 
 
 def launch(plan: "PlanConfig", code_root: str, kind: str, payload: Dict[str, Any], folder: str, gpu: Optional[int],
-           timeout: float) -> Tuple[Dict[str, Any], str, bool]:
+           timeout: float, extra_env: Optional[Dict[str, str]] = None) -> Tuple[Dict[str, Any], str, bool]:
     """Run one worker process (kind = run | adapt | prepare | gpucheck) and return (result, log path, stopped by timeout)."""
     os.makedirs(folder, exist_ok=True)
     spec_path, res_path, log_path = (os.path.join(folder, f"_{kind}_spec.json"), os.path.join(folder, f"_{kind}_result.json"),
@@ -285,7 +286,7 @@ def launch(plan: "PlanConfig", code_root: str, kind: str, payload: Dict[str, Any
     with open(log_path, "a") as lf:
         lf.write(f"\n===== {kind} {time.strftime('%Y-%m-%d %H:%M:%S')} on {'gpu ' + str(gpu) if gpu is not None else 'cpu'} =====\n")
         lf.flush()
-        p = subprocess.Popen(worker_command(kind, spec_path, res_path), stdout=lf, stderr=subprocess.STDOUT, env=worker_env(plan, gpu, code_root),
+        p = subprocess.Popen(worker_command(kind, spec_path, res_path), stdout=lf, stderr=subprocess.STDOUT, env={**worker_env(plan, gpu, code_root), **(extra_env or {})},
                              cwd=plan.work_dir)
         try:
             p.wait(timeout=max(30.0, timeout))
@@ -425,8 +426,9 @@ class PlanRunner:
                     self.prepared[stage] = None
                     self.log(f"[prepare] {stage}: ready in {time.time() - t:.0f} s | {res.get('summary', '')}")
                 else:
-                    self.prepared[stage] = (res.get("error") or "")[-600:]
-                    self.log(f"[prepare] {stage}: FAILED\n{_indent(tail(log_path))}")
+                    err = res.get("error") or ""
+                    self.prepared[stage] = _last_line(err)
+                    self.log(f"[prepare] {stage}: FAILED\n{_indent(chr(10).join(err.splitlines()[-40:]) if 'Traceback' in err else tail(log_path, 40))}")
             return self.prepared[stage]
 
     def gpu_check(self, gpus: List[int]) -> List[int]:
@@ -435,7 +437,8 @@ class PlanRunner:
         out: Dict[int, Tuple[Dict[str, Any], str]] = {}
 
         def one(g: int) -> None:
-            res, log_path, _ = launch(self.plan, self.code_root, "gpucheck", {}, os.path.join(self.plan.plan_dir, "gpucheck", str(g)), g, 900)
+            res, log_path, _ = launch(self.plan, self.code_root, "gpucheck", {}, os.path.join(self.plan.plan_dir, "gpucheck", str(g)), g, 900,
+                                     {"CUDA_LAUNCH_BLOCKING": "1"})      # synchronous kernels: an error names the operation that caused it
             out[g] = (res, log_path)
         ths = [threading.Thread(target=one, args=(g,)) for g in gpus]
         for th in ths:
@@ -449,7 +452,9 @@ class PlanRunner:
                 ok.append(g)
                 self.log(f"[gpu {g}] check ok: {res.get('summary', '')}")
             else:
-                self.log(f"[gpu {g}] check FAILED -- this GPU is not used: {res.get('error', '')[-300:]}\n{_indent(tail(log_path))}")
+                err = res.get("error", "")
+                self.log(f"[gpu {g}] check FAILED -- this GPU is not used: {_last_line(err)}\n"
+                         f"{_indent(chr(10).join(err.splitlines()[-40:]) if 'Traceback' in err else tail(log_path, 40))}")
         if not ok:
             raise RuntimeError("no GPU passed the check (see the logs above, folder _plan/gpucheck): the environment cannot train")
         return ok
@@ -468,10 +473,12 @@ class PlanRunner:
         """Log the outcome (with the end of the run's log when it failed) and stop the session on a systematic failure."""
         msg = {"done": f"DONE  CER {100 * res.get('CER', float('nan')):.2f} %" if "CER" in res else "DONE",
                "interrupted": "INTERRUPTED by the session deadline (resumes next session)",
-               "failed": f"FAILED (attempt {self.ledger.get(r['id'])['attempts']}/{self.plan.max_attempts}): {res.get('error', '')[-300:]}"}[res["status"]]
+               "failed": f"FAILED (attempt {self.ledger.get(r['id'])['attempts']}/{self.plan.max_attempts}): {_last_line(res.get('error', ''))}"}[res["status"]]
         self.log(f"[gpu {gpu}] {msg}  {r['id']}  [{wall / 3600:.2f} h]  | {self.progress()}")
-        if res["status"] == "failed" and log_path:
-            self.log(f"[gpu {gpu}] end of {log_path}:\n{_indent(tail(log_path))}")
+        if res["status"] == "failed":
+            err = res.get("error", "")
+            shown = "\n".join(err.rstrip().splitlines()[-40:]) if "Traceback" in err else (tail(log_path, 40) if log_path else err)
+            self.log(f"[gpu {gpu}] error of {r['id']} (full log: {log_path or '-'}):\n{_indent(shown)}")
         with self.ledger.lock:
             if res["status"] == "done":
                 self.session_done, self.consecutive_failures = self.session_done + 1, 0
@@ -725,16 +732,12 @@ def _result_from_run(cfg: Config, out: Any) -> Dict[str, Any]:
     return res
 
 
-def _cmd_run(spec_path: str, res_path: str) -> None:
+def _cmd_run(spec_path: str) -> Dict[str, Any]:
+    """Train (resumable) and evaluate one configuration."""
     from .main import main
     with open(spec_path) as f:
         cfg = Config.from_dict(json.load(f)["config"])
-    try:
-        res = _result_from_run(cfg, main(cfg))
-    except Exception:
-        res = {"status": "failed", "error": traceback.format_exc()}
-    with open(res_path, "w") as f:
-        json.dump(json_safe(res), f)
+    return _result_from_run(cfg, main(cfg))
 
 
 def export_adaptation_lines(plan: PlanConfig, target: str, folder: str, source_units: Sequence[str]) -> Dict[str, Any]:
@@ -773,96 +776,102 @@ def export_adaptation_lines(plan: PlanConfig, target: str, folder: str, source_u
     return {"lines": len(tr), "eval_lines": len(te), "anchors": len(anchors), "charset": charset, "language": spec.language, "rtl": spec.rtl}
 
 
-def _cmd_adapt(spec_path: str, res_path: str) -> None:
+def _cmd_adapt(spec_path: str) -> Dict[str, Any]:
+    """Zero-shot adaptation of a trained model to the lines of another corpus (CER versus labeled target lines)."""
     from .adapt import run_adapt_curve
     from .utils import torch_load
-    try:
-        with open(spec_path) as f:
-            payload = json.load(f)
-        plan = PlanConfig(**{k: (tuple(v) if isinstance(v, list) else v) for k, v in payload["plan"].items()})
-        r = payload["run"]
-        src_dir = os.path.join(plan.work_dir, r["source_run"])
-        with open(os.path.join(src_dir, "config.json")) as f:
-            cfg = Config.from_dict(json.load(f))
-        st = torch_load(os.path.join(src_dir, "checkpoints", "best.pt"))
-        out_dir = os.path.join(plan.work_dir, r["id"])
-        folder = os.path.join(plan.cache_dir, "adaptation", r["target"])
-        info = export_adaptation_lines(plan, r["target"], folder, st.get("units") or list(st["chars"]))
-        cfg.run.mode = "adapt_curve"
-        a = cfg.adapt
-        a.checkpoint, a.lines_dir = "best", folder
-        a.anchors_file, a.eval_file, a.out_dir = os.path.join(folder, "anchors.tsv"), os.path.join(folder, "eval.tsv"), out_dir
-        a.charset, a.rtl, a.anchor_counts = info["charset"], info["rtl"], tuple(plan.adaptation_anchor_counts)
-        a.target_languages = (plan.translation_target if info["language"] != plan.translation_target else "fr",)
-        cfg.llm.backend, cfg.llm.model_name, cfg.llm.source_language = "causal", plan.llm_name, info["language"]
-        with open(os.path.join(out_dir, "adaptation_setup.json"), "w") as f:
-            json.dump(json_safe(info), f, indent=1, ensure_ascii=False)
-        cfg.train.deadline_unix = float(payload.get("deadline_unix") or 0.0)
-        out = run_adapt_curve(cfg)
-        if isinstance(out, dict) and out.get("interrupted"):
-            res = {"status": "interrupted"}
-        else:
-            res = {"status": "done"} if os.path.exists(os.path.join(out_dir, "adapt_curve.json")) else {"status": "failed", "error": "no adapt_curve.json"}
-    except Exception:
-        res = {"status": "failed", "error": traceback.format_exc()}
-    with open(res_path, "w") as f:
-        json.dump(json_safe(res), f)
+    with open(spec_path) as f:
+        payload = json.load(f)
+    plan = PlanConfig(**{k: (tuple(v) if isinstance(v, list) else v) for k, v in payload["plan"].items()})
+    r = payload["run"]
+    src_dir = os.path.join(plan.work_dir, r["source_run"])
+    with open(os.path.join(src_dir, "config.json")) as f:
+        cfg = Config.from_dict(json.load(f))
+    st = torch_load(os.path.join(src_dir, "checkpoints", "best.pt"))
+    out_dir = os.path.join(plan.work_dir, r["id"])
+    folder = os.path.join(plan.cache_dir, "adaptation", r["target"])
+    info = export_adaptation_lines(plan, r["target"], folder, st.get("units") or list(st["chars"]))
+    cfg.run.mode = "adapt_curve"
+    a = cfg.adapt
+    a.checkpoint, a.lines_dir = "best", folder
+    a.anchors_file, a.eval_file, a.out_dir = os.path.join(folder, "anchors.tsv"), os.path.join(folder, "eval.tsv"), out_dir
+    a.charset, a.rtl, a.anchor_counts = info["charset"], info["rtl"], tuple(plan.adaptation_anchor_counts)
+    a.target_languages = (plan.translation_target if info["language"] != plan.translation_target else "fr",)
+    cfg.llm.backend, cfg.llm.model_name, cfg.llm.source_language = "causal", plan.llm_name, info["language"]
+    with open(os.path.join(out_dir, "adaptation_setup.json"), "w") as f:
+        json.dump(json_safe(info), f, indent=1, ensure_ascii=False)
+    cfg.train.deadline_unix = float(payload.get("deadline_unix") or 0.0)
+    out = run_adapt_curve(cfg)
+    if isinstance(out, dict) and out.get("interrupted"):
+        res = {"status": "interrupted"}
+    else:
+        res = {"status": "done"} if os.path.exists(os.path.join(out_dir, "adapt_curve.json")) else {"status": "failed", "error": "no adapt_curve.json"}
+    return res
 
 
-def _cmd_prepare(spec_path: str, res_path: str) -> None:
+def _cmd_prepare(spec_path: str) -> Dict[str, Any]:
     """Download and decode the corpora of a run configuration (no GPU): fills the manifests and line caches its runs will read."""
     from .data import HandwritingDataModule
     from .utils import setup_logging
-    try:
-        with open(spec_path) as f:
-            cfg = Config.from_dict(json.load(f)["config"])
-        cfg.run.name = os.path.join("_plan", "prepare", "_".join(cfg.data.sources) if len(cfg.data.sources) < 4 else "joint")
-        cfg.make_dirs()
-        setup_logging(cfg)
-        dm = HandwritingDataModule(cfg).prepare()
-        res = {"status": "done", "summary": f"train {len(dm.train_ds):,} | val {len(dm.val_ds):,} | test {len(dm.test_ds):,} lines | "
-                                            f"alphabet {dm.codec.num_classes - 1} units"}
-    except Exception:
-        res = {"status": "failed", "error": traceback.format_exc()}
-    with open(res_path, "w") as f:
-        json.dump(json_safe(res), f)
+    with open(spec_path) as f:
+        cfg = Config.from_dict(json.load(f)["config"])
+    cfg.run.name = os.path.join("_plan", "prepare", "_".join(cfg.data.sources) if len(cfg.data.sources) < 4 else "joint")
+    cfg.make_dirs()
+    setup_logging(cfg)
+    dm = HandwritingDataModule(cfg).prepare()
+    return {"status": "done", "summary": f"train {len(dm.train_ds):,} | val {len(dm.val_ds):,} | test {len(dm.test_ds):,} lines | "
+                                         f"alphabet {dm.codec.num_classes - 1} units"}
 
 
-def _cmd_gpucheck(spec_path: str, res_path: str) -> None:
-    """A few optimisation steps of the real model on random tensors on the visible GPU: fp16 autocast, GradScaler, cuDNN convolutions, the
-    recurrent / attention layers and the CTC loss.  This checks the environment (drivers, CUDA, cuDNN, memory), not the method."""
+def _cmd_gpucheck(spec_path: str) -> Dict[str, Any]:
+    """A few optimisation steps on random tensors on the visible GPU with every kind of operation a training step uses: the augmentation
+    (affine grids, sampling), the real model under fp16 autocast (cuDNN convolutions, recurrent and attention layers, the VQ codebooks), the
+    CTC loss, the leakage probe, GradScaler and AdamW.  It checks the environment (drivers, CUDA, cuDNN, memory), not the method; a failure
+    here costs seconds instead of every run."""
+    import numpy as np
     import torch
-    from .model import InkLinguaNet, ctc_per_sample
+    from .model import ClosedFormLeakage, GPUAugment, InkLinguaNet, ctc_per_sample
     from .style import NUM_DESC
-    try:
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA is not available in this process")
-        dev = torch.device("cuda")
-        cfg = Config()
-        model = InkLinguaNet(cfg.model, 80, NUM_DESC, 8, cfg.data.img_height).to(dev).train()
-        opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
-        scaler = torch.amp.GradScaler("cuda")
-        g = torch.Generator(device="cpu").manual_seed(0)
-        t0 = time.time()
-        for _ in range(3):
-            x = torch.rand(8, 1, cfg.data.img_height, 1024, generator=g).to(dev)
-            wd = torch.full((8,), 1024, dtype=torch.long, device=dev)
-            tgt = torch.randint(1, 80, (8, 40), generator=g).to(dev)
-            with torch.autocast(device_type="cuda", dtype=torch.float16):
-                out = model(x, wd)
-            loss = ctc_per_sample(out["log_probs"].float(), out["out_lens"], tgt, torch.full((8,), 40, dtype=torch.long, device=dev)).mean()
-            opt.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
-            scaler.step(opt)
-            scaler.update()
-        torch.cuda.synchronize()
-        p = torch.cuda.get_device_properties(dev)
-        res = {"status": "done", "summary": f"{p.name}, {p.total_memory / 2 ** 30:.0f} GB | torch {torch.__version__} | CUDA {torch.version.cuda} | "
-                                            f"cuDNN {torch.backends.cudnn.version()} | 3 fp16 steps in {time.time() - t0:.1f} s, loss {float(loss):.2f}"}
-    except Exception:
-        res = {"status": "failed", "error": traceback.format_exc()}
-    with open(res_path, "w") as f:
-        json.dump(json_safe(res), f)
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is not available in this process")
+    dev = torch.device("cuda")
+    cfg = Config()
+    model = InkLinguaNet(cfg.model, 80, NUM_DESC, 8, cfg.data.img_height).to(dev).train()
+    aug = GPUAugment(cfg.train, np.zeros(NUM_DESC, np.float32), np.ones(NUM_DESC, np.float32))
+    leak = ClosedFormLeakage(cfg.model.d_model, NUM_DESC, 64, cfg.train.leak_ridge, cfg.train.leak_slack, np.ones(NUM_DESC, bool), np.zeros(NUM_DESC),
+                             dev, refit_every=1)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    scaler = torch.amp.GradScaler("cuda")
+    g = torch.Generator(device="cpu").manual_seed(0)
+    B, W, L = 8, 1024, 40
+    t0 = time.time()
+    for _ in range(12):                                                 # the leakage probe is fitted from the 9th step on
+        x = torch.rand(B, 1, cfg.data.img_height, W, generator=g).to(dev)
+        wd = torch.full((B,), W, dtype=torch.long, device=dev)
+        st, ok = torch.zeros(B, NUM_DESC, device=dev), torch.ones(B, NUM_DESC, dtype=torch.bool, device=dev)
+        x_s, _, wd, _, _, _ = aug(x, st, ok, wd, torch.full((B,), 64, dtype=torch.long, device=dev))
+        tgt = torch.randint(1, 80, (B, L), generator=g).to(dev)
+        with torch.autocast(device_type="cuda", dtype=torch.float16):
+            out = model(x_s, wd)
+        loss = ctc_per_sample(out["log_probs"].float(), out["out_lens"], tgt, torch.full((B,), L, dtype=torch.long, device=dev)).mean()
+        content = torch.randn(B, cfg.model.d_model, device=dev, requires_grad=True)          # stands for the pooled content stream
+        loss = loss + leak(content, torch.randn(B, NUM_DESC, device=dev), torch.ones(B, NUM_DESC, device=dev))
+        opt.zero_grad(set_to_none=True)
+        scaler.scale(loss).backward()
+        scaler.step(opt)
+        scaler.update()
+    torch.cuda.synchronize()
+    if leak.W is None:
+        raise RuntimeError("the leakage probe was never fitted")
+    p = torch.cuda.get_device_properties(dev)
+    return {"status": "done", "summary": f"{p.name}, {p.total_memory / 2 ** 30:.0f} GB | torch {torch.__version__} | CUDA {torch.version.cuda} | "
+                                         f"cuDNN {torch.backends.cudnn.version()} | 12 fp16 training steps in {time.time() - t0:.1f} s, loss {float(loss):.2f}"}
+
+
+def _last_line(err: str) -> str:
+    """The exception line of a traceback (or the whole short message)."""
+    lines = [x for x in (err or "").strip().splitlines() if x.strip()]
+    return lines[-1][:300] if lines else ""
 
 
 def _indent(text: str, pad: str = "    | ") -> str:
@@ -873,8 +882,28 @@ WORKER_COMMANDS = {"run": _cmd_run, "adapt": _cmd_adapt, "prepare": _cmd_prepare
 
 
 def worker_main(argv: Sequence[str]) -> None:
-    """Entry point of a worker process:  <entry> {run|adapt|prepare|gpucheck} <spec.json> <result.json>."""
-    WORKER_COMMANDS[argv[0]](argv[1], argv[2])
+    """Entry point of a worker process:  <entry> {run|adapt|prepare|gpucheck} <spec.json> <result.json>.
+
+    The result file is written in every case, and the process then ends with os._exit, WITHOUT interpreter teardown.  Reason (Kaggle log):
+    after a CUDA error the context is broken, and freeing any GPU tensor afterwards -- when the garbage collector ran while the traceback
+    was being formatted -- threw from a C++ destructor and aborted the process (exit code -6) before the error was recorded.  Here the
+    collector is switched off as soon as an exception is caught, the traceback is printed and saved, and nothing is freed afterwards."""
+    import gc
+    kind, spec_path, res_path = argv[0], argv[1], argv[2]
+    try:
+        res = WORKER_COMMANDS[kind](spec_path)
+    except BaseException:
+        gc.disable()
+        res = {"status": "failed", "error": traceback.format_exc()}
+        print(res["error"], flush=True)
+    tmp = res_path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(json_safe(res), f)
+    os.replace(tmp, res_path)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    logging.shutdown()
+    os._exit(1 if res.get("status") == "failed" else 0)
 
 
 if __name__ == "__main__":

@@ -435,18 +435,28 @@ def fragment_distillation(student_lp: torch.Tensor, teacher_lp: torch.Tensor, le
 
 class ClosedFormLeakage:
     """[CFL] Closed-form leakage penalty on the content stream, with a transcription-explained floor.  A queue holds recent (content
-    embedding, standardised style target, measured-mask) triples; every step a ridge regression is fitted on the queue in closed form
-    and applied to the CURRENT batch; the encoder minimises  mean_j relu( E[yhat_j^2] - floor_j - slack )  over the active descriptors
-    (targets are z-scores, so E[yhat^2] estimates the explained variance).  floor_j = R2 the TRANSCRIPTION alone achieves."""
+    embedding, standardised style target, measured-mask) triples; a ridge regression is fitted on the queue in closed form and applied to
+    the CURRENT batch; the encoder minimises  mean_j relu( E[yhat_j^2] - floor_j - slack )  over the active descriptors (targets are
+    z-scores, so E[yhat^2] estimates the explained variance).  floor_j = R2 the TRANSCRIPTION alone achieves.
 
-    def __init__(self, dim: int, n_desc: int, size: int, ridge: float, slack: float, active: np.ndarray, floor: np.ndarray, device: torch.device):
-        self.size, self.ridge, self.slack = int(size), float(ridge), float(slack)
+    The probe is refitted every `refit_every` steps, on the CPU in float64 (a few 256 x 256 systems: milliseconds), and kept on the device in
+    between.  Training therefore never calls a GPU linear-algebra solver (cuSOLVER / MAGMA): on the Kaggle T4 with the CUDA 13 build such a
+    call broke the CUDA context of every run.  The queue changes by one batch per step, so a probe that is at most `refit_every` steps old
+    measures the same leakage; queued values that are not finite (an fp16 overflow) skip the refit instead of poisoning the solve."""
+
+    def __init__(self, dim: int, n_desc: int, size: int, ridge: float, slack: float, active: np.ndarray, floor: np.ndarray, device: torch.device,
+                 refit_every: int = 10):
+        self.size, self.ridge, self.slack, self.refit_every = int(size), float(ridge), float(slack), max(1, int(refit_every))
         self.active = [int(j) for j in np.flatnonzero(np.asarray(active, bool))]
         self.floor = torch.as_tensor(np.asarray(floor, np.float32), device=device)
         self.C = torch.zeros(self.size, dim, device=device)
         self.Y = torch.zeros(self.size, n_desc, device=device)
         self.M = torch.zeros(self.size, n_desc, device=device)
         self.n, self.ptr = 0, 0
+        self.W: Optional[torch.Tensor] = None              # the fitted probe (dim x n_desc), its input mean / std
+        self.mu: Optional[torch.Tensor] = None
+        self.sd: Optional[torch.Tensor] = None
+        self.since_fit = self.refit_every
         self.last_vals: Optional[torch.Tensor] = None
 
     @torch.no_grad()
@@ -459,13 +469,37 @@ class ClosedFormLeakage:
         self.ptr = (self.ptr + b) % self.size
         self.n = min(self.n + b, self.size)
 
+    @torch.no_grad()
+    def _refit(self) -> None:
+        """Ridge probe per active descriptor on the queued lines where it was measured (float64, CPU)."""
+        Cq, Yq, Mq = (t[:self.n].detach().to("cpu", torch.float64) for t in (self.C, self.Y, self.M))
+        if not (torch.isfinite(Cq).all() and torch.isfinite(Yq).all()):
+            return                                          # keep the previous probe
+        mu, sd = Cq.mean(0), Cq.std(0) + 1e-4
+        A = (Cq - mu) / sd
+        W = torch.zeros(A.size(1), Yq.size(1), dtype=torch.float64)
+        eye = torch.eye(A.size(1), dtype=torch.float64)
+        for j in self.active:
+            mj = Mq[:, j]
+            nj = float(mj.sum())
+            if nj < 32:                                     # measured on too few queued lines: no penalty for this descriptor
+                continue
+            Aj = A * mj[:, None]
+            W[:, j] = torch.linalg.solve(Aj.t() @ A / nj + self.ridge * eye, Aj.t() @ Yq[:, j] / nj)
+        dev = self.C.device
+        self.W, self.mu, self.sd = W.to(dev, torch.float32), mu.to(dev, torch.float32), sd.to(dev, torch.float32)
+
     def state_dict(self) -> Dict[str, Any]:
-        return {"C": self.C, "Y": self.Y, "M": self.M, "n": self.n, "ptr": self.ptr}
+        return {"C": self.C, "Y": self.Y, "M": self.M, "n": self.n, "ptr": self.ptr, "W": self.W, "mu": self.mu, "sd": self.sd,
+                "since_fit": self.since_fit}
 
     def load_state_dict(self, st: Dict[str, Any]) -> None:
         for k in ("C", "Y", "M"):
             getattr(self, k).copy_(st[k].to(getattr(self, k).device))
         self.n, self.ptr = int(st["n"]), int(st["ptr"])
+        dev = self.C.device
+        self.W, self.mu, self.sd = ((st.get(k).to(dev) if st.get(k) is not None else None) for k in ("W", "mu", "sd"))
+        self.since_fit = int(st.get("since_fit", self.refit_every))
 
     @property
     def last(self) -> Dict[str, float]:
@@ -481,21 +515,15 @@ class ClosedFormLeakage:
         if not self.active or self.n < max(64, self.size // 4):
             self._push(c.detach(), y, m)
             return zero
+        if self.W is None or self.since_fit >= self.refit_every:
+            self._refit()
+            self.since_fit = 0
+        self.since_fit += 1
+        if self.W is None:
+            self._push(c.detach(), y, m)
+            return zero
         act = torch.as_tensor(self.active, device=c.device)
-        with torch.no_grad():                               # one batched ridge solve for all active descriptors, no host sync
-            Cq, Yq, Mq = self.C[:self.n], self.Y[:self.n], self.M[:self.n]
-            mu, sd = Cq.mean(0), Cq.std(0) + 1e-4
-            A = (Cq - mu) / sd                                              # n x D
-            Ma = Mq[:, act].t()                                             # J x n   (measured masks)
-            nj = Ma.sum(1)                                                  # J
-            Am = A.unsqueeze(0) * Ma.unsqueeze(-1)                          # J x n x D
-            eye = torch.eye(A.size(1), device=c.device)
-            G = Am.transpose(1, 2) @ A / nj.clamp(min=1.0)[:, None, None] + self.ridge * eye
-            rhs = (Am.transpose(1, 2) @ Yq[:, act].t().unsqueeze(-1)).squeeze(-1) / nj.clamp(min=1.0)[:, None]
-            Wj = torch.linalg.solve(G, rhs) * (nj >= 32).to(A.dtype)[:, None]   # descriptors measured on < 32 queued lines: no penalty
-            W = torch.zeros(A.size(1), Yq.size(1), device=c.device)
-            W[:, act] = Wj.t()
-        pred = ((c - mu) / sd) @ W
+        pred = ((c - self.mu) / self.sd) @ self.W
         leak = (pred ** 2 * m).sum(0) / m.sum(0).clamp(min=1.0)
         pen = torch.relu(leak[act] - self.floor[act] - self.slack).mean()
         self.last_vals = leak[act].detach()

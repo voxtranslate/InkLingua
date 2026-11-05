@@ -98,7 +98,7 @@ class Trainer:
         self.prev_cov: Optional[float] = None
         self.cov_hist: List[float] = []
         self.leak = ClosedFormLeakage(cfg.model.d_model, NUM_DESC, self.tc.leak_queue, self.tc.leak_ridge, self.tc.leak_slack, data.leak_active,
-                                      np.clip(data.text_baseline_r2, 0.0, 1.0), device)
+                                      np.clip(data.text_baseline_r2, 0.0, 1.0), device, self.tc.leak_refit_every)
         self.use_amp = bool(self.tc.amp and device.type == "cuda")
         self.amp_dtype = torch.float32
         if self.use_amp:   # bf16 only where it is native (compute capability >= 8); fp16 + GradScaler elsewhere
