@@ -332,7 +332,8 @@ def build_paper(plan, runs: Sequence[Dict[str, Any]], state: Dict[str, Dict[str,
             if fs:
                 ax.axhline(100 * np.mean(fs), color="k", ls=":", lw=1, label="100 % labels")
             ax.set_xscale("log"), ax.set_title(c, fontsize=9), ax.set_xlabel("labeled training lines (%)"), ax.set_ylabel("test CER (%)")
-            ax.legend(fontsize=6)
+            if ax.get_legend_handles_labels()[0]:
+                ax.legend(fontsize=6)
             t5.append(row)
         for k in range(len(corpora), nrow * ncol):
             axes[k // ncol][k % ncol].axis("off")
@@ -472,7 +473,7 @@ def _write_repro(plan, rows, out) -> None:
     p = os.path.join(plan.work_dir, "_plan", "code_sha256.txt")
     if os.path.exists(p):
         code_sha = open(p).read().strip()
-    L = [f"# Reproducibility\n\nInkLingua v{__version__}; code archive sha256 `{code_sha or 'n/a'}`; torch {torch.__version__}; CUDA {torch.version.cuda}; "
+    L = [f"# Reproducibility\n\nInkLingua v{__version__}; code sha256 `{code_sha or 'n/a'}` (the notebook cell, or the repository archive); torch {torch.__version__}; CUDA {torch.version.cuda}; "
          f"Python {platform.python_version()}; LLM `{plan.llm_name}`; seeds {list(plan.seeds)}; main label budget {int(100 * plan.labeled_fraction)} %.\n",
          "## Datasets\n", "| key | Hub dataset | pinned revision | resolved commit | language / script / era | split sizes | caps |", "|---|---|---|---|---|---|---|"]
     for k in dict.fromkeys(list(plan.corpora) + (list(plan.joint_corpora) if plan.joint else [])):

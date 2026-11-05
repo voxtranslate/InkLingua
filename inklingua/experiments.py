@@ -89,6 +89,9 @@ class PlanConfig:
     session_hours: float = 11.3                                   # Kaggle sessions stop at 12 h: keep a margin for the final reports
     max_parallel: int = 0                                         # 0 = one run per visible GPU
     max_attempts: int = 3
+    max_consecutive_failures: int = 4                              # this many failed attempts in a row and no run finished in this session ->
+                                                                  # the session stops (a systematic error, e.g. a broken environment)
+    dry_run: bool = False                                         # True: check the GPUs, prepare the first corpus, print the plan, stop
     keep_checkpoints: str = "core"                                # "core" | "all" | "none" (best.pt after evaluation)
     cleanup_caches: bool = True
     persist_cache_gb: float = 8.0                                 # at the end of a session, the line caches (preprocessed lines + manifests) of
@@ -241,6 +244,68 @@ def run_done_marker(plan: PlanConfig, r: Dict[str, Any]) -> str:
 # ==============================================================================
 # workers
 # ==============================================================================
+# How a run process is started.  The repository runs the package module; the single-cell notebook writes its own source to a file and
+# sets WORKER_ENTRY = [that file].  -X faulthandler: a native crash (SIGABRT / SIGSEGV) prints the Python stack into the run's log.
+WORKER_ENTRY: List[str] = ["-m", "inklingua.experiments"]
+
+
+def worker_command(*args: str) -> List[str]:
+    return [sys.executable, "-X", "faulthandler", *WORKER_ENTRY, *args]
+
+
+def worker_env(plan: "PlanConfig", gpu: Optional[int], code_root: str) -> Dict[str, str]:
+    """Environment of a run process: ONE visible GPU (or none), no progress bars, Hub cache of the session, the HF token of the notebook."""
+    env = os.environ.copy()
+    env.update({"CUDA_VISIBLE_DEVICES": "" if gpu is None else str(gpu), "PYTHONPATH": code_root + os.pathsep + env.get("PYTHONPATH", ""),
+                "TQDM_DISABLE": "1", "TOKENIZERS_PARALLELISM": "false", "HF_HOME": os.path.join(plan.cache_dir, "hf_home"), "PYTHONUNBUFFERED": "1",
+                "PYTHONFAULTHANDLER": "1", "INKLINGUA_WORKER": "1"})
+    return env
+
+
+def tail(path: str, n: int = 25) -> str:
+    """The last n lines of a log file (shown in the notebook when a run fails)."""
+    try:
+        with open(path, errors="replace") as f:
+            return "".join(f.readlines()[-n:])
+    except OSError:
+        return "(no log)"
+
+
+def launch(plan: "PlanConfig", code_root: str, kind: str, payload: Dict[str, Any], folder: str, gpu: Optional[int],
+           timeout: float) -> Tuple[Dict[str, Any], str, bool]:
+    """Run one worker process (kind = run | adapt | prepare | gpucheck) and return (result, log path, stopped by timeout)."""
+    os.makedirs(folder, exist_ok=True)
+    spec_path, res_path, log_path = (os.path.join(folder, f"_{kind}_spec.json"), os.path.join(folder, f"_{kind}_result.json"),
+                                     os.path.join(folder, "stdout.log" if kind in ("run", "adapt") else f"{kind}.log"))
+    with open(spec_path, "w") as f:
+        json.dump(json_safe(payload), f, indent=1)
+    if os.path.exists(res_path):
+        os.remove(res_path)
+    stopped = False
+    with open(log_path, "a") as lf:
+        lf.write(f"\n===== {kind} {time.strftime('%Y-%m-%d %H:%M:%S')} on {'gpu ' + str(gpu) if gpu is not None else 'cpu'} =====\n")
+        lf.flush()
+        p = subprocess.Popen(worker_command(kind, spec_path, res_path), stdout=lf, stderr=subprocess.STDOUT, env=worker_env(plan, gpu, code_root),
+                             cwd=plan.work_dir)
+        try:
+            p.wait(timeout=max(30.0, timeout))
+        except subprocess.TimeoutExpired:
+            stopped = True                                    # SIGTERM: a training writes a step checkpoint and exits
+            p.terminate()
+            try:
+                p.wait(timeout=180)
+            except subprocess.TimeoutExpired:
+                p.kill()
+    res = {"status": "failed", "error": f"no result file (exit code {p.returncode}{', SIGABRT: native abort' if p.returncode == -6 else ''}"
+                                        f"{', SIGKILL: out of memory?' if p.returncode == -9 else ''}); see {log_path}"}
+    if os.path.exists(res_path):
+        with open(res_path) as f:
+            res = json.load(f)
+    elif stopped:
+        res = {"status": "interrupted"}
+    return res, log_path, stopped
+
+
 def detect_gpus() -> List[int]:
     try:
         out = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=30).stdout
@@ -259,6 +324,9 @@ class PlanRunner:
         self.deadline = self.t0 + plan.session_hours * 3600
         self.paper_lock = threading.Lock()
         self.running: Dict[str, int] = {}
+        self.stage_locks: Dict[str, threading.Lock] = {}
+        self.prepared: Dict[str, Optional[str]] = {}         # stage -> None (ok) or the error of its preparation
+        self.session_done, self.consecutive_failures, self.halt = 0, 0, ""
         for r in self.runs:                              # reconcile the ledger with the files (a copied output may be ahead of the ledger)
             st = self.ledger.get(r["id"])
             if os.path.exists(run_done_marker(plan, r)):
@@ -310,6 +378,8 @@ class PlanRunner:
 
     def worker(self, gpu: int) -> None:
         while True:
+            if self.halt:
+                return
             with self.ledger.lock:
                 r = self.next_run()
                 if r is None:
@@ -330,51 +400,108 @@ class PlanRunner:
                     return
                 time.sleep(60)
                 continue
+            if r["kind"] == "run":
+                err = self.ensure_prepared(r)
+                if err is not None:
+                    self.record_failure(r, gpu, {"status": "failed", "error": f"data preparation failed: {err}"}, 0.0, "")
+                    continue
             self.execute(r, gpu)
+
+    # ---------------------------------------------------------------- data preparation and GPU check (separate processes)
+    def ensure_prepared(self, r: Dict[str, Any]) -> Optional[str]:
+        """Download and decode the corpora of r's stage ONCE, in a CPU-only process, before any of its runs starts: no two runs race for the
+        same cache, and no training process ever decodes (or forks) next to a CUDA context."""
+        stage = r["stage"]
+        with self.ledger.lock:
+            lock = self.stage_locks.setdefault(stage, threading.Lock())
+        with lock:
+            if stage not in self.prepared:
+                self.log(f"[prepare] {stage}: downloading / decoding (once; cached for every run of this stage)")
+                t = time.time()
+                cfg = run_config(self.plan, r, self.n_workers)
+                res, log_path, _ = launch(self.plan, self.code_root, "prepare", {"config": cfg.to_dict()}, os.path.join(self.plan.plan_dir, "prepare", stage),
+                                          None, 6 * 3600)
+                if res.get("status") == "done":
+                    self.prepared[stage] = None
+                    self.log(f"[prepare] {stage}: ready in {time.time() - t:.0f} s | {res.get('summary', '')}")
+                else:
+                    self.prepared[stage] = (res.get("error") or "")[-600:]
+                    self.log(f"[prepare] {stage}: FAILED\n{_indent(tail(log_path))}")
+            return self.prepared[stage]
+
+    def gpu_check(self, gpus: List[int]) -> List[int]:
+        """Train a few steps of the real model (fp16 autocast, GradScaler, CTC, cuDNN) on random tensors on every GPU, each in its own process:
+        a broken GPU / CUDA / cuDNN setup is found in seconds and reported with its log, instead of failing every run."""
+        out: Dict[int, Tuple[Dict[str, Any], str]] = {}
+
+        def one(g: int) -> None:
+            res, log_path, _ = launch(self.plan, self.code_root, "gpucheck", {}, os.path.join(self.plan.plan_dir, "gpucheck", str(g)), g, 900)
+            out[g] = (res, log_path)
+        ths = [threading.Thread(target=one, args=(g,)) for g in gpus]
+        for th in ths:
+            th.start()
+        for th in ths:
+            th.join()
+        ok = []
+        for g in gpus:
+            res, log_path = out[g]
+            if res.get("status") == "done":
+                ok.append(g)
+                self.log(f"[gpu {g}] check ok: {res.get('summary', '')}")
+            else:
+                self.log(f"[gpu {g}] check FAILED -- this GPU is not used: {res.get('error', '')[-300:]}\n{_indent(tail(log_path))}")
+        if not ok:
+            raise RuntimeError("no GPU passed the check (see the logs above, folder _plan/gpucheck): the environment cannot train")
+        return ok
+
+    def record_failure(self, r: Dict[str, Any], gpu: int, res: Dict[str, Any], wall: float, log_path: str) -> None:
+        with self.ledger.lock:
+            self.running.pop(r["id"], None)
+            st = self.ledger.get(r["id"])
+            st["status"], st["finished"] = "failed", time.strftime("%Y-%m-%d %H:%M:%S")
+            st["attempts"] = st.get("attempts", 0) + 1
+            st["error"] = res.get("error", "")[-4000:]
+            self.ledger.save()
+        self.after_result(r, gpu, res, wall, log_path)
+
+    def after_result(self, r: Dict[str, Any], gpu: int, res: Dict[str, Any], wall: float, log_path: str) -> None:
+        """Log the outcome (with the end of the run's log when it failed) and stop the session on a systematic failure."""
+        msg = {"done": f"DONE  CER {100 * res.get('CER', float('nan')):.2f} %" if "CER" in res else "DONE",
+               "interrupted": "INTERRUPTED by the session deadline (resumes next session)",
+               "failed": f"FAILED (attempt {self.ledger.get(r['id'])['attempts']}/{self.plan.max_attempts}): {res.get('error', '')[-300:]}"}[res["status"]]
+        self.log(f"[gpu {gpu}] {msg}  {r['id']}  [{wall / 3600:.2f} h]  | {self.progress()}")
+        if res["status"] == "failed" and log_path:
+            self.log(f"[gpu {gpu}] end of {log_path}:\n{_indent(tail(log_path))}")
+        with self.ledger.lock:
+            if res["status"] == "done":
+                self.session_done, self.consecutive_failures = self.session_done + 1, 0
+            elif res["status"] == "failed":
+                self.consecutive_failures += 1
+                if self.session_done == 0 and self.consecutive_failures >= self.plan.max_consecutive_failures and not self.halt:
+                    self.halt = (f"{self.consecutive_failures} attempts failed in a row and no run has finished in this session: a systematic error. "
+                                 f"The session stops instead of spending the plan; fix the cause shown above and run again (finished work is kept).")
+                    self.log("[STOP] " + self.halt)
 
     def execute(self, r: Dict[str, Any], gpu: int) -> None:
         plan = self.plan
         run_dir = os.path.join(plan.work_dir, r["id"])
         os.makedirs(run_dir, exist_ok=True)
         stop_at = self.deadline - self.reserve_seconds(r)
-        spec_path, res_path = os.path.join(run_dir, "_spec.json"), os.path.join(run_dir, "_result.json")
         if r["kind"] == "run":
             cfg = run_config(plan, r, self.n_workers)
             cfg.train.deadline_unix = stop_at
             payload = {"config": cfg.to_dict()}
         else:
             payload = {"plan": dataclasses.asdict(plan), "run": r, "deadline_unix": stop_at}
-        with open(spec_path, "w") as f:
-            json.dump(json_safe(payload), f, indent=1)
-        if os.path.exists(res_path):
-            os.remove(res_path)
-        env = os.environ.copy()
-        env.update({"CUDA_VISIBLE_DEVICES": str(gpu), "PYTHONPATH": self.code_root + os.pathsep + env.get("PYTHONPATH", ""), "TQDM_DISABLE": "1",
-                    "TOKENIZERS_PARALLELISM": "false", "HF_HOME": os.path.join(plan.cache_dir, "hf_home"), "PYTHONUNBUFFERED": "1"})
         self.log(f"[gpu {gpu}] START {r['id']}  ({r['profile']} evaluation, ~{self.estimate_hours(r):.1f} h estimated)")
         t = time.time()
-        with open(os.path.join(run_dir, "stdout.log"), "a") as lf:
-            lf.write(f"\n===== session start {time.strftime('%Y-%m-%d %H:%M:%S')} on gpu {gpu} =====\n")
-            lf.flush()
-            p = subprocess.Popen([sys.executable, "-m", "inklingua.experiments", r["kind"], spec_path, res_path], stdout=lf, stderr=subprocess.STDOUT,
-                                 env=env, cwd=plan.work_dir)
-            stopped_by_plan = False
-            try:
-                p.wait(timeout=max(60.0, self.deadline + 15 * 60 - time.time()))
-            except subprocess.TimeoutExpired:
-                stopped_by_plan = True                        # SIGTERM: a training writes a step checkpoint and exits
-                p.terminate()
-                try:
-                    p.wait(timeout=180)
-                except subprocess.TimeoutExpired:
-                    p.kill()
+        res, log_path, _ = launch(plan, self.code_root, r["kind"], payload, run_dir, gpu, self.deadline + 15 * 60 - time.time())
         wall = time.time() - t
-        res = {"status": "failed", "error": f"no result file (exit code {p.returncode})"}
-        if stopped_by_plan and not os.path.exists(res_path):
-            res = {"status": "interrupted"}                    # the session ended: not a failure, no attempt is counted
-        if os.path.exists(res_path):
-            with open(res_path) as f:
-                res = json.load(f)
+        if res["status"] == "failed":
+            self.ledger.get(r["id"])["seconds"] = self.ledger.get(r["id"]).get("seconds", 0.0) + wall
+            self.record_failure(r, gpu, res, wall, log_path)
+            self.refresh_paper()
+            return
         with self.ledger.lock:
             self.running.pop(r["id"], None)
             st = self.ledger.get(r["id"])
@@ -384,14 +511,8 @@ class PlanRunner:
             for k in ("train_steps", "epochs_trained", "best_epoch", "CER"):
                 if k in res:
                     st[k] = res[k]
-            if res["status"] == "failed":
-                st["attempts"] = st.get("attempts", 0) + 1
-                st["error"] = res.get("error", "")[-4000:]
             self.ledger.save()
-        msg = {"done": f"DONE  CER {100 * res.get('CER', float('nan')):.2f} %" if "CER" in res else "DONE",
-               "interrupted": "INTERRUPTED by the session deadline (resumes next session)",
-               "failed": f"FAILED (attempt {self.ledger.get(r['id'])['attempts']}/{plan.max_attempts}): {res.get('error', '')[-300:]}"}[res["status"]]
-        self.log(f"[gpu {gpu}] {msg}  {r['id']}  [{wall / 3600:.2f} h]  | {self.progress()}")
+        self.after_result(r, gpu, res, wall, log_path)
         if res["status"] == "done":
             self.prune(r)
             self.cleanup_caches()
@@ -495,15 +616,24 @@ class PlanRunner:
         gpus = detect_gpus()
         if not gpus:
             raise RuntimeError("no GPU visible (nvidia-smi -L): the plan trains real models on real data and needs a GPU (Kaggle: GPU T4 x2)")
+        gpus = self.gpu_check(gpus)
         self.n_workers = min(len(gpus), self.plan.max_parallel or len(gpus))
         self.log(f"GPUs: {len(gpus)} -> {self.n_workers} runs in parallel | session budget {self.plan.session_hours:.1f} h | work dir {self.plan.work_dir}")
         self.log(self.describe())
+        if self.plan.dry_run:
+            first = next((r for r in self.runs if r["kind"] == "run" and self.ledger.get(r["id"])["status"] not in ("done", "skipped")), None)
+            err = self.ensure_prepared(first) if first is not None else None
+            self.log(f"dry run finished: GPUs {gpus} ok, data of '{first['stage'] if first else '-'}' {'ready' if err is None else 'FAILED'}; "
+                     "set dry_run=False to start the plan")
+            return {"progress": self.progress(), "paper": os.path.join(self.plan.work_dir, "paper"), "dry_run": True}
         threads = [threading.Thread(target=self.worker, args=(g,), daemon=True) for g in gpus[:self.n_workers]]
         for k, th in enumerate(threads):
             th.start()
             time.sleep(20 if k == 0 else 0)          # stagger: the first run downloads the corpus, the second one then reads the shared caches
         for th in threads:
             th.join()
+        if self.halt:
+            self.log("[STOP] " + self.halt)
         self.refresh_paper()
         self.persist_caches()
         self.log("session finished | " + self.progress())
@@ -679,6 +809,73 @@ def _cmd_adapt(spec_path: str, res_path: str) -> None:
         json.dump(json_safe(res), f)
 
 
+def _cmd_prepare(spec_path: str, res_path: str) -> None:
+    """Download and decode the corpora of a run configuration (no GPU): fills the manifests and line caches its runs will read."""
+    from .data import HandwritingDataModule
+    from .utils import setup_logging
+    try:
+        with open(spec_path) as f:
+            cfg = Config.from_dict(json.load(f)["config"])
+        cfg.run.name = os.path.join("_plan", "prepare", "_".join(cfg.data.sources) if len(cfg.data.sources) < 4 else "joint")
+        cfg.make_dirs()
+        setup_logging(cfg)
+        dm = HandwritingDataModule(cfg).prepare()
+        res = {"status": "done", "summary": f"train {len(dm.train_ds):,} | val {len(dm.val_ds):,} | test {len(dm.test_ds):,} lines | "
+                                            f"alphabet {dm.codec.num_classes - 1} units"}
+    except Exception:
+        res = {"status": "failed", "error": traceback.format_exc()}
+    with open(res_path, "w") as f:
+        json.dump(json_safe(res), f)
+
+
+def _cmd_gpucheck(spec_path: str, res_path: str) -> None:
+    """A few optimisation steps of the real model on random tensors on the visible GPU: fp16 autocast, GradScaler, cuDNN convolutions, the
+    recurrent / attention layers and the CTC loss.  This checks the environment (drivers, CUDA, cuDNN, memory), not the method."""
+    import torch
+    from .model import InkLinguaNet, ctc_per_sample
+    from .style import NUM_DESC
+    try:
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA is not available in this process")
+        dev = torch.device("cuda")
+        cfg = Config()
+        model = InkLinguaNet(cfg.model, 80, NUM_DESC, 8, cfg.data.img_height).to(dev).train()
+        opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
+        scaler = torch.amp.GradScaler("cuda")
+        g = torch.Generator(device="cpu").manual_seed(0)
+        t0 = time.time()
+        for _ in range(3):
+            x = torch.rand(8, 1, cfg.data.img_height, 1024, generator=g).to(dev)
+            wd = torch.full((8,), 1024, dtype=torch.long, device=dev)
+            tgt = torch.randint(1, 80, (8, 40), generator=g).to(dev)
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                out = model(x, wd)
+            loss = ctc_per_sample(out["log_probs"].float(), out["out_lens"], tgt, torch.full((8,), 40, dtype=torch.long, device=dev)).mean()
+            opt.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
+        torch.cuda.synchronize()
+        p = torch.cuda.get_device_properties(dev)
+        res = {"status": "done", "summary": f"{p.name}, {p.total_memory / 2 ** 30:.0f} GB | torch {torch.__version__} | CUDA {torch.version.cuda} | "
+                                            f"cuDNN {torch.backends.cudnn.version()} | 3 fp16 steps in {time.time() - t0:.1f} s, loss {float(loss):.2f}"}
+    except Exception:
+        res = {"status": "failed", "error": traceback.format_exc()}
+    with open(res_path, "w") as f:
+        json.dump(json_safe(res), f)
+
+
+def _indent(text: str, pad: str = "    | ") -> str:
+    return "\n".join(pad + line for line in text.rstrip().splitlines())
+
+
+WORKER_COMMANDS = {"run": _cmd_run, "adapt": _cmd_adapt, "prepare": _cmd_prepare, "gpucheck": _cmd_gpucheck}
+
+
+def worker_main(argv: Sequence[str]) -> None:
+    """Entry point of a worker process:  <entry> {run|adapt|prepare|gpucheck} <spec.json> <result.json>."""
+    WORKER_COMMANDS[argv[0]](argv[1], argv[2])
+
+
 if __name__ == "__main__":
-    cmd = sys.argv[1]
-    {"run": _cmd_run, "adapt": _cmd_adapt}[cmd](sys.argv[2], sys.argv[3])
+    worker_main(sys.argv[1:])

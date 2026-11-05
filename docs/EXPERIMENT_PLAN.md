@@ -1,6 +1,7 @@
 # The experiment plan of the article
 
-`notebooks/InkLingua_Kaggle_T4x2.ipynb` is one code cell with one entry point.  It runs `inklingua.experiments.run_plan` on real data
+`notebooks/InkLingua_Kaggle_T4x2.ipynb` is one readable code cell that contains the complete code (generated from the package by
+`tools/build_kaggle_notebook.py`) and one entry point.  It runs `run_plan` on real data
 only (no synthetic data, no dummy model, no smoke test), and it continues where it stopped in the next Kaggle session.  The plan, the
 rules and the outputs are below; every number is produced by the code in `inklingua/experiments.py`, `inklingua/schedule.py` and
 `inklingua/paper.py`.
@@ -83,6 +84,14 @@ The run computes its budget from its actual data (after label filtering); the ta
 
 ## How a session runs on Kaggle (GPU T4 x2)
 
+* Every GPU is first checked in its own process: three fp16 training steps of the real model (cuDNN convolutions, recurrent and
+  attention layers, CTC, GradScaler) on random tensors.  A GPU that fails is reported with its log and not used; if none passes, the
+  session stops before any run.
+* Every corpus is downloaded and decoded once, in a CPU-only process, before its first run (decoding uses spawned worker processes,
+  never `fork`).  Runs only read the caches.
+* A failed run prints the end of its log in the notebook output.  Run processes use Python's fault handler, so a native crash leaves
+  a Python stack in `<run>/stdout.log`.  After 4 failed attempts in a row with no run finished in the session, the session stops
+  (a systematic error) instead of spending the plan.  A run stopped by the session end is not a failure.
 * Two runs train in parallel, one per T4.  Each run is its own process pinned to its GPU, so memory is released between runs.  The
   LLM (Qwen2.5-1.5B) shares the GPU of the run that needs it.
 * No run starts unless its evaluation reserve plus 30 minutes of training remain: 100 minutes for the full evaluation, 40 for the

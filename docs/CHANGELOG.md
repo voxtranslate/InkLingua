@@ -24,6 +24,8 @@ Fixed (full list with locations in `docs/AUDIT_v10_to_v11.md`)
 * Download and preprocessing cache: offline-first pinned snapshots, a self-sufficient line cache on by default, parallel decoding, caches carried across Kaggle sessions.
 * Clean logs (no self-tests in real runs, no HTTP request lines, one HF token line); derived run names; the epoch budget rule by default.
 * PyTorch practice: `weights_only=True` checkpoints, batched leakage penalty and VQ reset (no per-step host syncs), `inference_mode`, `torch.amp.GradScaler`; torch >= 2.5.
+* The Kaggle notebook is one READABLE cell with the complete code (sections in reading order, table of contents), generated from the package; run processes execute the cell's own source.
+* Plan robustness (Kaggle log: every run on GPU 0 aborted with exit code -6 within 20 s): GPU check per GPU, corpus preparation in a CPU-only process, spawn instead of fork for decoding, fault handler in run processes, the end of a failed run's log in the notebook, a stop after repeated failures, `dry_run`.
 * Training curves gained FRAG-RC panels (trusted share, per-cell coverage, realised error of trusted characters).
 * The suite summary reports WER, post-hoc and system CER, a component-contribution table, and can re-aggregate without retraining.
 

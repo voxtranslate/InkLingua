@@ -1,6 +1,7 @@
 """Generic utilities: seeding, strict JSON, logging, devices, atomic checkpoints, running means."""
 from __future__ import annotations
 
+import csv
 import logging
 import math
 import os
@@ -8,12 +9,32 @@ import warnings
 import random
 import sys
 from collections import defaultdict
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence
 
 import numpy as np
 import torch
 
 LOG = logging.getLogger("inklingua")
+
+
+def write_csv(path: str, header: Sequence[str], rows: Sequence[Sequence[Any]]) -> None:
+    """CSV with a header; NaN / inf / None written as empty cells."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        for r in rows:
+            w.writerow(["" if (isinstance(v, float) and not np.isfinite(v)) or v is None else v for v in r])
+
+
+def repository_selftests():
+    """The repository's self-test module (fast invariant tests + the synthetic smoke).  It is not part of the Kaggle notebook, which runs real
+    experiments only; there this raises a clear error instead of a NameError."""
+    import importlib
+    try:
+        return importlib.import_module("inklingua.selftest")
+    except ModuleNotFoundError as e:
+        raise RuntimeError("the repository self-tests (inklingua/selftest.py, synthetic data) are not part of this notebook") from e
 
 
 def set_seed(seed: int) -> None:
@@ -87,12 +108,13 @@ def quiet_third_party() -> None:
         disable_progress_bars()
     except Exception:
         pass
-    try:
-        import datasets as _hfd
-        _hfd.utils.logging.set_verbosity_warning()
-        _hfd.utils.logging.disable_progress_bar()
-    except Exception:
-        pass
+    if "datasets" in sys.modules:                         # configure the `datasets` library only if it is in use: importing it would load
+        try:                                                # pyarrow's native runtime into every training process for nothing
+            _hfd = sys.modules["datasets"]
+            _hfd.utils.logging.set_verbosity_warning()
+            _hfd.utils.logging.disable_progress_bar()
+        except Exception:
+            pass
     for name in _NOISY_LOGGERS:                                         # after the imports: huggingface_hub resets its level on import
         logging.getLogger(name).setLevel(logging.WARNING)
     logging.getLogger("huggingface_hub").setLevel(logging.ERROR)        # its token hint is logged once below, as an INFO line
@@ -107,6 +129,8 @@ def resolve_hf_token() -> str:
     subprocess.  Without a token the public corpora still download (lower rate limits)."""
     if os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN"):
         return "authenticated (HF_TOKEN from the environment)"
+    if os.environ.get("INKLINGUA_WORKER") == "1":            # a run process: the notebook already looked (no Kaggle client in workers)
+        return "unauthenticated (public datasets only)"
     try:
         from kaggle_secrets import UserSecretsClient          # only exists on Kaggle
         tok = UserSecretsClient().get_secret("HF_TOKEN")

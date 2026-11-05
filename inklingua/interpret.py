@@ -13,7 +13,6 @@ extra label beyond the references it already has, and writes the numbers behind 
 """
 from __future__ import annotations
 
-import csv
 import json
 import os
 import warnings
@@ -31,16 +30,7 @@ from .pseudo import PERTURBATIONS, apply_perturbation
 from .riskcontrol import auroc
 from .style import STYLE_NAMES, assign_nearest, kmeans_np
 from .text import align_chars, bootstrap_cer_ci, cer, edit_distance
-from .utils import LOG, json_safe, to_device
-
-
-def _write_csv(path: str, header: Sequence[str], rows: Sequence[Sequence[Any]]) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(header)
-        for r in rows:
-            w.writerow(["" if (isinstance(v, float) and not np.isfinite(v)) or v is None else v for v in r])
+from .utils import LOG, json_safe, to_device, write_csv
 
 
 def _ridge_classifier_cv(X: np.ndarray, y: np.ndarray, folds: int = 2, lam: float = 1.0, seed: int = 0) -> float:
@@ -125,7 +115,7 @@ class InterpretMixin:
         maj = float(np.bincount(np.unique(y[keep], return_inverse=True)[1]).max() / max(keep.sum(), 1))
         out = {"layers": rows, "majority_class_accuracy": maj, "n_lines": len(slant), "note": "2-fold ridge probes; accuracy far above the majority class = linearly "
                "readable character identity; slant R2 from the mean-pooled state = how much writer style the content stream still carries at that depth"}
-        _write_csv(os.path.join(folder, "layer_probes.csv"), ["layer", "name", "char_probe_accuracy", "slant_probe_r2", "n_frames"],
+        write_csv(os.path.join(folder, "layer_probes.csv"), ["layer", "name", "char_probe_accuracy", "slant_probe_r2", "n_frames"],
                    [[r["layer"], r["name"], r["char_probe_accuracy"], r["slant_probe_r2"], r["n_frames"]] for r in rows])
         fig, ax = plt.subplots(figsize=(7, 4))
         ax.plot([r["layer"] for r in rows], [r["char_probe_accuracy"] for r in rows], "o-", label="character identity (probe accuracy)")
@@ -205,7 +195,7 @@ class InterpretMixin:
             rk = np.argsort(np.argsort(S, axis=0), axis=0).astype(np.float64)
             C = np.corrcoef(rk.T)
             res["spearman_between_signals"] = {names[a]: {names[b]: float(C[a, b]) for b in range(len(names))} for a in range(len(names))}
-        _write_csv(os.path.join(folder, "uncertainty_signals.csv"), ["line_index", "has_error", "edits", "ref_len"] + names,
+        write_csv(os.path.join(folder, "uncertainty_signals.csv"), ["line_index", "has_error", "edits", "ref_len"] + names,
                    [[i, int(bad[k]), int(ed[k]), int(rl[k])] + S[k].tolist() for k, i in enumerate(ids)])
         fig, ax = plt.subplots(1, 2, figsize=(12, 4.2))
         aur = [res["signals"][n]["auroc_line_has_error"] for n in names]
@@ -313,7 +303,7 @@ class InterpretMixin:
                 ax.set_title(("QUERY " if c_ == 0 else f"sim {sims[j]:.2f} ") + f"line {i} | slant {raw[j, 0]:+.0f} stroke {raw[j, 1]:.3f}", fontsize=6)
                 rows.append([int(R["idx"][q]), c_, i, float(sims[j]) if c_ else 1.0] + raw[j].tolist())
         self._fig("05_style/style_neighbours.png", "Nearest neighbours in the style embedding (query = left column)", fig)
-        _write_csv(os.path.join(folder, "style_neighbours.csv"), ["query_line", "rank", "line_index", "cosine"] + STYLE_NAMES, rows)
+        write_csv(os.path.join(folder, "style_neighbours.csv"), ["query_line", "rank", "line_index", "cosine"] + STYLE_NAMES, rows)
         return {"neighbour_vs_random_descriptor_gap_ratio": ratios, "note": "< 1 means embedding neighbours have more similar measured style than random pairs"}
 
     # ------------------------------------------------------------------ alignments
@@ -426,7 +416,7 @@ class InterpretMixin:
                 rec = {"lines": int(m.sum()), "CER": float(ed[m].sum() / rl[m].sum()), "CER_ci95": [lo, hi], "CER_final": float(edf[m].sum() / rl[m].sum())}
                 out[gname][v] = rec
                 rows.append([gname, v, rec["lines"], rec["CER"], lo, hi, rec["CER_final"]])
-        _write_csv(os.path.join(folder, "groups.csv"), ["grouping", "group", "lines", "CER", "ci_lo", "ci_hi", "CER_final"], rows)
+        write_csv(os.path.join(folder, "groups.csv"), ["grouping", "group", "lines", "CER", "ci_lo", "ci_hi", "CER_final"], rows)
         return out
 
     def run_interpretability(self, ds, R: Dict[str, Any]) -> Dict[str, Any]:

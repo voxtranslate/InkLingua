@@ -16,7 +16,7 @@ import numpy as np
 
 from .style import STYLE_NAMES
 from .text import bootstrap_cer_ci
-from .utils import LOG, json_safe
+from .utils import LOG, json_safe, write_csv
 
 _REPORT_REFS = [{"label": "HTR-VT, all 6,482 labeled IAM-line training lines, no external data (arXiv 2409.08573; Pattern Recognition 2025)", "cer": 0.047,
                  "note": "different label budget: context only, NOT a like-for-like comparison"}]
@@ -56,15 +56,6 @@ def _spearman(a: np.ndarray, b: np.ndarray) -> float:
     ra, rb = ra - ra.mean(), rb - rb.mean()
     d = math.sqrt(float((ra ** 2).sum() * (rb ** 2).sum()))
     return float((ra * rb).sum() / d) if d > 0 else float("nan")
-
-
-def _write_csv(path: str, header: Sequence[str], rows: Sequence[Sequence[Any]]) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(header)
-        for r in rows:
-            w.writerow(["" if (isinstance(v, float) and not np.isfinite(v)) or v is None else v for v in r])
 
 
 def read_predictions_csv(path: str) -> Dict[str, Any]:
@@ -279,36 +270,36 @@ def collect_report_data(infer_dir: str, run_dir: Optional[str] = None, curve_dir
 def export_report_folders(D: Dict[str, Any], out: str) -> None:
     L = D["lines"]
     os.makedirs(out, exist_ok=True)
-    _write_csv(os.path.join(out, "01_ledger", "ledger.csv"), ["step", "CER", "ci_lo", "ci_hi", "adopted", "kind", "note"],
+    write_csv(os.path.join(out, "01_ledger", "ledger.csv"), ["step", "CER", "ci_lo", "ci_hi", "adopted", "kind", "note"],
                [[e["label"], e.get("cer"), (e.get("ci") or [None, None])[0], (e.get("ci") or [None, None])[1], e.get("adopted"), e.get("kind"), e.get("note")] for e in D["ledger"]])
     with open(os.path.join(out, "01_ledger", "headline.json"), "w") as f:
         json.dump(json_safe({"meta": D["meta"], "head": D["head"], "insight": D["insights"].get("ledger")}), f, indent=2, allow_nan=False)
     keys = ["idx", "corpus", "cer", "conf", "dis", "ed", "rl", "edf", "strat"] + list(STYLE_NAMES) + ["gt", "pr", "pf"] + (["edw", "pw", "clus"] if L.get("edw") else [])
-    _write_csv(os.path.join(out, "02_error_terrain", "lines.csv"), keys, [[L[k][i] for k in keys] for i in range(len(L["idx"]))])
-    _write_csv(os.path.join(out, "02_error_terrain", "blocks.csv"), ["first_line", "lines", "CER"], [[a, D["blocks"]["size"], c] for a, c in zip(D["blocks"]["first"], D["blocks"]["cer"])])
-    _write_csv(os.path.join(out, "03_concentration_abstention", "lorenz.csv"), ["share_of_lines_worst_first", "share_of_edits"], list(zip(D["lorenz"]["x"], D["lorenz"]["y"])))
+    write_csv(os.path.join(out, "02_error_terrain", "lines.csv"), keys, [[L[k][i] for k in keys] for i in range(len(L["idx"]))])
+    write_csv(os.path.join(out, "02_error_terrain", "blocks.csv"), ["first_line", "lines", "CER"], [[a, D["blocks"]["size"], c] for a, c in zip(D["blocks"]["first"], D["blocks"]["cer"])])
+    write_csv(os.path.join(out, "03_concentration_abstention", "lorenz.csv"), ["share_of_lines_worst_first", "share_of_edits"], list(zip(D["lorenz"]["x"], D["lorenz"]["y"])))
     A = D["abstain"]
-    _write_csv(os.path.join(out, "03_concentration_abstention", "risk_coverage.csv"), ["abstained_share", "CER_of_kept_by_model_doubt", "CER_of_kept_oracle", "share_of_edits_removed"],
+    write_csv(os.path.join(out, "03_concentration_abstention", "risk_coverage.csv"), ["abstained_share", "CER_of_kept_by_model_doubt", "CER_of_kept_oracle", "share_of_edits_removed"],
                list(zip(A["a"], A["conf"], A["oracle"], A["share"])))
     rows = []
     for b in D["bins"] + [D["lenbins"]]:
         for k, r in enumerate(b["rows"]):
             rows.append([b["label"], k + 1, r["lo"], r["hi"], r["n"], r["cer"], (r["ci"] or [None, None])[0], (r["ci"] or [None, None])[1], r["cer_final"]])
-    _write_csv(os.path.join(out, "04_who_is_hard", "style_bins.csv"), ["property", "quintile", "from", "to", "lines", "CER", "ci_lo", "ci_hi", "CER_final"], rows)
+    write_csv(os.path.join(out, "04_who_is_hard", "style_bins.csv"), ["property", "quintile", "from", "to", "lines", "CER", "ci_lo", "ci_hi", "CER_final"], rows)
     if D.get("train"):
         s = D["train"]["series"]
         ks = list(s.keys())
-        _write_csv(os.path.join(out, "05_training_story", "history.csv"), ks, list(zip(*[s[k] for k in ks])))
+        write_csv(os.path.join(out, "05_training_story", "history.csv"), ks, list(zip(*[s[k] for k in ks])))
         fk = [k for k in ks if k.startswith("frag_") or k.startswith("train_frag") or k == "epoch"]
         if len(fk) > 1:
-            _write_csv(os.path.join(out, "06_trust_audit", "frag_timeline.csv"), fk, list(zip(*[s[k] for k in fk])))
+            write_csv(os.path.join(out, "06_trust_audit", "frag_timeline.csv"), fk, list(zip(*[s[k] for k in fk])))
     if D.get("frag"):
         fa = D["frag"]
-        _write_csv(os.path.join(out, "06_trust_audit", "frag_audit.csv"), ["stratum", "lines", "characters", "trusted_share", "error_of_trusted", "error_of_doubtful", "target"],
+        write_csv(os.path.join(out, "06_trust_audit", "frag_audit.csv"), ["stratum", "lines", "characters", "trusted_share", "error_of_trusted", "error_of_doubtful", "target"],
                    [[s["stratum"], s["lines"], s["chars"], s["trusted_share"], s["err_trusted"], s["err_doubtful"], fa.get("target")] for s in fa["strata"]])
     if D.get("wsd"):
         w = D["wsd"]
-        _write_csv(os.path.join(out, "07_writer_adaptation", "wsd_clusters.csv"), ["split", "cluster", "lines", "CER_before", "CER_after"],
+        write_csv(os.path.join(out, "07_writer_adaptation", "wsd_clusters.csv"), ["split", "cluster", "lines", "CER_before", "CER_after"],
                    [[sp, g, c["lines"], c["CER_before"], c["CER_after"]] for sp, key in (("val_gate", "val_by_cluster"), ("test", "test_by_cluster")) for g, c in (w.get(key) or {}).items()])
     if D.get("traces"):
         with open(os.path.join(out, "08_reading_traces", "traces.json"), "w", encoding="utf-8") as f:

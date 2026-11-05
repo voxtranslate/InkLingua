@@ -444,7 +444,7 @@ def build_line_cache(src: SplitSource, indices: np.ndarray, H: int, max_w: int, 
             return
         import concurrent.futures as cf
         import multiprocessing as mp
-        ctx = mp.get_context("spawn" if torch.cuda.is_initialized() else "fork")
+        ctx = mp.get_context("spawn")          # never fork: the parent may hold pyarrow / download / CUDA-driver threads (fork-unsafe)
         chunks = [list(map(int, indices[a:a + 64])) for a in range(0, n, 64)]
         with cf.ProcessPoolExecutor(workers, mp_context=ctx, initializer=_decoder_init,
                                     initargs=(src, H, max_w, min_w, pad_x, crop_band)) as ex:
