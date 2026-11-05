@@ -27,16 +27,6 @@ def write_csv(path: str, header: Sequence[str], rows: Sequence[Sequence[Any]]) -
             w.writerow(["" if (isinstance(v, float) and not np.isfinite(v)) or v is None else v for v in r])
 
 
-def repository_selftests():
-    """The repository's self-test module (fast invariant tests + the synthetic smoke).  It is not part of the Kaggle notebook, which runs real
-    experiments only; there this raises a clear error instead of a NameError."""
-    import importlib
-    try:
-        return importlib.import_module("inklingua.selftest")
-    except ModuleNotFoundError as e:
-        raise RuntimeError("the repository self-tests (inklingua/selftest.py, synthetic data) are not part of this notebook") from e
-
-
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -65,9 +55,8 @@ _LOG_STACK = []
 
 
 def setup_logging(cfg, replace: bool = True) -> None:
-    """Log to stdout and to <run_dir>/run.log.  The v10 self-tests called main() for a synthetic run, which replaced the
-    handlers of the REAL run with handlers pointing into a temporary directory that was then deleted; here the previous handlers
-    are remembered (`push`) and `restore_logging()` puts them back."""
+    """Log to stdout and to <run_dir>/run.log.  The previous handlers are remembered, so that a nested run (v10 ran one inside the
+    real run, whose handlers then pointed into a deleted temporary directory) can be undone with `restore_logging()`."""
     os.makedirs(cfg.run_dir, exist_ok=True)
     if replace:
         _LOG_STACK.append((list(LOG.handlers), LOG.level))

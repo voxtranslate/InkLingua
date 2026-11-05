@@ -191,7 +191,7 @@ def apply_profile(cfg: Config, profile: str) -> None:
 
 def run_config(plan: PlanConfig, r: Dict[str, Any], n_parallel: int = 1) -> Config:
     base = Config()
-    base.run.work_dir, base.run.seed, base.run.self_test, base.run.mode = plan.work_dir, r["seed"], False, "single"
+    base.run.work_dir, base.run.seed, base.run.mode = plan.work_dir, r["seed"], "single"
     base.data.source, base.data.reader = "hf", "parquet"
     base.data.sources = tuple(r["sources"])
     base.data.labeled_fraction = r["lf"]

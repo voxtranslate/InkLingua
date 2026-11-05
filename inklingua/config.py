@@ -7,7 +7,6 @@ The most used entry points:
     Config.labeled_only()            THE baseline: same labeled lines, no unlabeled data
     Config.ablation("no_frag")       one component removed (see Config.ablation for the list)
     Config.multi(("iam", "rimes"))   train on several corpora of the registry at once (docs/DATASETS.md)
-    Config.smoke()                   a tiny synthetic configuration for plumbing tests
     cfg.run.mode = "suite"           train / evaluate every variant for every seed (the experiment a paper needs)
 """
 from __future__ import annotations
@@ -66,9 +65,8 @@ class RunConfig:
     device: str = "auto"                       # "auto" | "cpu" | "cuda" | "cuda:1"
     do_train: bool = True
     do_infer: bool = True
-    self_test: bool = False                    # True: run the fast invariant tests before anything else.  Off for real runs: the tests use
-                                               # synthetic data and belong to the repository (pytest / mode="smoke"), not to an experiment log
-    smoke_test: bool = False                   # True ONLY for Config.smoke(): permits synthetic data, stamps outputs
+    smoke_test: bool = False                   # True only for a test run on generated lines (never set by an experiment): permits a generated
+                                               # data source and stamps every output as not for publication
     log_level: str = "INFO"
     # "single"        train + evaluate this configuration
     # "suite"         train / evaluate every variant for every seed and write the seed-paired comparison (suite_summary.*)
@@ -76,7 +74,6 @@ class RunConfig:
     # "finetune"      start from cfg.train.init_from (any InkLingua checkpoint), grow the alphabet to the new data, train, evaluate
     # "adapt" / "adapt_curve" / "source_calib"  zero-shot adaptation to a new written language from a folder of line images (AdaptConfig)
     # "report"        rebuild inference/<split>/12_report/index.html of an EXISTING run from its files (no model, no download)
-    # "smoke"         the synthetic end-to-end smoke (train -> resume -> inference) in a temporary directory
     mode: str = "single"
     suite_preset: str = "paper"                # "quick" | "paper" | "all" | "custom" (then suite_variants is used)
     suite_variants: Tuple[str, ...] = ("labeled_only", "legacy_pl", "full")
@@ -85,7 +82,7 @@ class RunConfig:
 
 @dataclass
 class DataConfig:
-    source: str = "hf"                         # "hf" (download) | "local" (parquet folder, see local_dir) | "synthetic" (smoke test only)
+    source: str = "hf"                         # "hf" (download) | "local" (parquet folder, see local_dir)
     reader: str = "parquet"                    # "parquet" (pyarrow, parquet files only, no second Arrow copy on disk) | "datasets" (HF datasets library)
     sources: Tuple[str, ...] = ("iam",)        # registry keys (inklingua.datasets_registry.DATASETS); several = multi-corpus training
     custom_sources: Tuple[DatasetSpec, ...] = ()   # specs that are not in the registry
@@ -129,8 +126,6 @@ class DataConfig:
     decode_workers: int = 0                    # processes that decode / preprocess images on a cache miss; 0 = all CPUs (at most 8)
     decontaminate: bool = False                # remove train lines whose image also occurs in validation / test, and validation lines that occur in
                                                # test (counted in provenance.json); False = such overlap is an error (strict_checks)
-    synthetic_sizes: Tuple[int, int, int] = (600, 120, 120)
-    synthetic_words: Tuple[int, int] = (3, 6)  # words per synthetic line (offline smoke tests only)
 
 
 @dataclass
@@ -605,45 +600,6 @@ class Config:
             c.model.film = False
         else:
             raise ValueError(f"unknown ablation '{kind}' (choose from {cls.ABLATIONS})")
-        return c
-
-    @classmethod
-    def smoke(cls, work_dir: str = "./inklingua_smoke") -> "Config":
-        """Tiny SYNTHETIC configuration used to validate the whole pipeline offline.  Its numbers mean nothing scientifically;
-        outputs are stamped as such."""
-        c = cls()
-        c.run.name, c.run.work_dir, c.run.smoke_test = "smoke", work_dir, True
-        c.train.auto_schedule = False
-        c.data.line_cache_dir = None
-        c.data.source, c.data.sources = "synthetic", ("synthetic",)
-        c.data.img_height, c.data.max_img_width, c.data.pad_x = 32, 512, 4
-        c.data.batch_size, c.data.eval_batch_size, c.data.num_workers = 16, 16, 0
-        c.data.synthetic_sizes, c.data.labeled_fraction = (1200, 48, 48), 0.5
-        c.data.synthetic_words = (2, 3)
-        c.data.train_eval_subset = 48
-        c.model.channels, c.model.d_model, c.model.heads = (8, 16, 32, 48), 64, 4
-        c.model.ffn, c.model.enc_layers = 128, 2
-        c.model.low_dim, c.model.codes_low, c.model.codes_high, c.model.style_dim = 32, 32, 64, 32
-        c.train.epochs, c.train.lr, c.train.warmup_steps = 24, 2e-3, 60
-        c.train.aug_tilt_px = 1.5
-        c.train.aux_start_epoch, c.train.aux_ramp_epochs = 5, 5
-        c.train.vq_start_epoch, c.train.vq_anneal_epochs = 5, 5
-        c.train.save_every, c.train.noise_eval_samples = 4, 30
-        c.train.pseudo.warmup_epochs, c.train.pseudo.refresh_every = 10, 3
-        c.train.pseudo.min_stability, c.train.pseudo.target_cer, c.train.pseudo.min_calib = 0, 0.12, 30
-        c.train.frag.warmup_epochs, c.train.frag.refresh_every, c.train.frag.min_chars, c.train.frag.diag_lines = 8, 4, 30, 40
-        c.train.frag.target_err, c.train.mixline_prob = 0.12, 0.2
-        c.data.val_block = 8
-        c.infer.wsd_steps, c.infer.wsd_min_lines, c.infer.wsd_clusters, c.infer.wsd_batch = (3, 6), 6, 2, 8
-        c.train.patience, c.train.leak_queue = 0, 256
-        c.data.calib_fraction = 0.15
-        c.train.pseudo.llm_refine = False
-        c.llm.backend = "dummy"
-        c.infer.n_vis, c.infer.n_translate, c.infer.ig_steps = 3, 4, 4
-        c.infer.pl_diag_samples, c.infer.occl_window, c.infer.occl_stride = 60, 16, 8
-        c.infer.llm_rescoring, c.infer.bootstrap = False, 200
-        c.infer.probe_lines, c.infer.mc_dropout_samples, c.infer.uncertainty_lines = 48, 3, 48
-        c.infer.counterfactual_lines, c.infer.neighbour_queries, c.infer.longline_pairs = 2, 2, 20
         return c
 
 

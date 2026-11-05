@@ -1,4 +1,4 @@
-"""Entry point.  `main(cfg)` dispatches on cfg.run.mode; `python inklingua.py` runs the default IAM experiment."""
+"""Entry point of one run.  `main(cfg)` dispatches on cfg.run.mode (single run, suite, fine-tuning, adaptation, report)."""
 from __future__ import annotations
 
 import os
@@ -10,7 +10,7 @@ from .llm import LLMEngine
 from .model import InkLinguaNet
 from .protocol import write_protocol
 from .style import NUM_DESC
-from .utils import LOG, repository_selftests, resolve_device, resolve_llm_device, set_seed, setup_logging
+from .utils import LOG, resolve_device, resolve_llm_device, set_seed, setup_logging
 
 
 def run_single(cfg: Config, base_units: Optional[Sequence[str]] = None) -> Optional[Dict[str, Any]]:
@@ -24,9 +24,6 @@ def run_single(cfg: Config, base_units: Optional[Sequence[str]] = None) -> Optio
     cfg.save()
     device = resolve_device(cfg.run.device)
     LOG.info("InkLingua v%s | run dir: %s | device: %s | seed %d | corpora %s", __version__, cfg.run_dir, device, cfg.run.seed, cfg.data.sources)
-    if cfg.run.self_test:
-        repository_selftests().run_self_tests()
-        set_seed(cfg.run.seed)
     data = HandwritingDataModule(cfg, base_units=base_units).prepare()
     if not cfg.llm.source_language:
         cfg.llm.source_language = data.primary_language
@@ -91,8 +88,6 @@ def main(cfg: Optional[Config] = None) -> Optional[Dict[str, Any]]:
         setup_logging(cfg)
         build_run_report(cfg.infer_dir, cfg.run_dir, curve_dir=cfg.curve_dir)
         return None
-    if mode == "smoke":
-        return repository_selftests().run_smoke()
     if mode != "single":
         raise ValueError(f"unknown cfg.run.mode '{mode}'")
     return run_single(cfg)

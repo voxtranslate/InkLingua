@@ -1,5 +1,5 @@
 """
-Data: preprocessing, sources (Hugging Face Hub / local parquet / synthetic), the line cache, the dataset class that serves BOTH
+Data: preprocessing, sources (Hugging Face Hub / local parquet), the line cache, the dataset class that serves BOTH
 tasks (recognition + style), the collator with MixLine, width-bucketed batching and the data module that assembles one or
 several corpora.
 
@@ -29,7 +29,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 import torch
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageFont
 from torch.utils.data import DataLoader, Dataset, Sampler
 
 from .config import Config, DatasetSpec
@@ -251,15 +251,6 @@ def _real_source(src: SplitSource) -> SplitSource:
     return src.materialize() if isinstance(src, CachedSplit) else src
 
 
-_SYN_WORDS = ("the of and to in is that it was for on are with as his they be at one have this from or had by "
-              "hot word but what some we can out other were all there when up use your how said an each she "
-              "which do their time if will way about many then them write would like so these her long make "
-              "thing see him two has look more day could go come did number sound no most people my over know "
-              "water than call first who may down side been now find head stand own page should country found "
-              "answer school grow study still learn plant cover food sun four between state keep eye never last "
-              "let thought city tree cross farm hard start might story saw far sea draw left late run").split()
-
-
 def font_paths() -> List[str]:
     try:
         import matplotlib as mpl
@@ -278,48 +269,6 @@ def load_font(path: Optional[str], size: int):
         return ImageFont.load_default(size=size)
     except Exception:
         return ImageFont.load_default()
-
-
-def render_synthetic_line(text: str, rng: random.Random, fonts: List[str]) -> Image.Image:
-    """Offline 'handwriting': varied fonts / slant / stroke / blur / noise (for smoke tests only)."""
-    font = load_font(rng.choice(fonts) if fonts else None, rng.randint(40, 56))
-    stroke = rng.choice([0, 0, 1, 2])
-    ink = int(rng.uniform(0, 90))
-    tmp = ImageDraw.Draw(Image.new("L", (8, 8)))
-    x0, y0, x1, y1 = tmp.textbbox((0, 0), text, font=font, stroke_width=stroke)
-    w = (x1 - x0) + 60
-    canvas = Image.new("L", (w, 128), 255)
-    ImageDraw.Draw(canvas).text((30 - x0, 64 - (y1 - y0) // 2 - y0), text, font=font, fill=ink, stroke_width=stroke, stroke_fill=ink)
-    shear = rng.uniform(-0.35, 0.35)
-    canvas = canvas.transform(canvas.size, Image.AFFINE, (1, shear, -shear * 64, 0, 1, 0), resample=Image.BILINEAR, fillcolor=255)
-    arr = np.asarray(canvas, np.float32)
-    arr = cv2.GaussianBlur(arr, (0, 0), rng.uniform(0.3, 1.1))
-    arr = np.clip(arr + np.random.RandomState(rng.randint(0, 10 ** 6)).normal(0, rng.uniform(1, 6), arr.shape), 0, 255)
-    return Image.fromarray(arr.astype(np.uint8))
-
-
-class SyntheticSource(SplitSource):
-    def __init__(self, n: int, seed: int, words: Tuple[int, int] = (3, 6)):
-        rng, fonts = random.Random(seed), font_paths()
-        self._texts = [" ".join(rng.choice(_SYN_WORDS) for _ in range(rng.randint(*words))) for _ in range(n)]
-        self._imgs = [render_synthetic_line(t, rng, fonts) for t in self._texts]
-
-    def __len__(self): return len(self._texts)
-    def image(self, j): return self._imgs[int(j)]
-    def text(self, j): return self._texts[int(j)]
-
-
-class ListSource(SplitSource):
-    """Tiny in-memory split rendered from a list of texts (self-tests)."""
-
-    def __init__(self, texts: List[str], seed: int = 0):
-        rng, fonts = random.Random(seed), font_paths()
-        self._t = list(texts)
-        self._im = [render_synthetic_line(t, rng, fonts) for t in texts]
-
-    def __len__(self): return len(self._t)
-    def image(self, j): return self._im[int(j)]
-    def text(self, j): return self._t[int(j)]
 
 
 # ==============================================================================
@@ -761,6 +710,11 @@ class ListBatchSampler(Sampler):
 # ==============================================================================
 # the data module
 # ==============================================================================
+# Sources that GENERATE their lines instead of reading a corpus: {cfg.data.source name: factory(data_module, spec) -> splits}.  Empty in
+# normal use; only test code registers one (and a run that uses it must say it is a test run, see _load_sources).
+GENERATED_SOURCES: Dict[str, Any] = {}
+
+
 class HandwritingDataModule:
     """Downloads (Hub) or reads (local parquet) one or several corpora, checks their integrity, splits them, builds datasets and
     loaders.  There is NO fallback to synthetic data: if the real data cannot be obtained the run stops."""
@@ -789,7 +743,7 @@ class HandwritingDataModule:
 
     @property
     def is_synthetic(self) -> bool:
-        return self.using_synthetic or self.dc.source == "synthetic"
+        return self.using_synthetic or self.dc.source in GENERATED_SOURCES
 
     @property
     def domain_names(self) -> List[str]:
@@ -939,31 +893,25 @@ class HandwritingDataModule:
         mk = lambda k: HFSource(dsd[k], col, spec.image_col, spec.text_col)  # noqa: E731
         return {"train": mk(k_tr), "val": mk(k_va), "test": mk(k_te) if k_te else None}
 
-    def _synthetic(self) -> Dict[str, Optional[SplitSource]]:
-        self.using_synthetic = True
-        n_tr, n_va, n_te = self.dc.synthetic_sizes
-        s, w = self.cfg.run.seed, self.dc.synthetic_words
-        LOG.warning("=" * 78)
-        LOG.warning("SYNTHETIC SMOKE TEST: fake handwriting, for plumbing tests only -- NOT FOR PUBLICATION")
-        LOG.warning("=" * 78)
-        self.provenance.setdefault("sources", {})["synthetic"] = {"synthetic": True, "sizes": list(self.dc.synthetic_sizes)}
-        return {"train": SyntheticSource(n_tr, s, w), "val": SyntheticSource(n_va, s + 1, w), "test": SyntheticSource(n_te, s + 2, w)}
-
     def _load_sources(self) -> List[Dict[str, Optional[SplitSource]]]:
-        """One {'train','val','test'} dict per corpus (same order as self.specs).  Overridden by the self-tests."""
+        """One {'train','val','test'} dict per corpus (same order as self.specs).  A source that GENERATES its lines (GENERATED_SOURCES,
+        filled only by test code) is refused unless the run is explicitly a test run: a real run never trains on generated data."""
         dc = self.dc
-        self.provenance.update({"source": dc.source, "sources": {}, "synthetic": dc.source == "synthetic"})
-        if dc.source == "synthetic":
+        gen = GENERATED_SOURCES.get(dc.source)
+        self.provenance.update({"source": dc.source, "sources": {}, "synthetic": gen is not None})
+        if gen is not None:
             if not self.cfg.run.smoke_test:
-                raise RuntimeError("cfg.data.source='synthetic' is only permitted through Config.smoke() (run.smoke_test=True): a real run "
-                                   "never trains on synthetic data.")
-            return [self._synthetic() for _ in self.specs]
+                raise RuntimeError(f"cfg.data.source='{dc.source}' generates its lines: only a test run (run.smoke_test=True) may use it; a real "
+                                   "run never trains on generated data.")
+            self.using_synthetic = True
+            LOG.warning("GENERATED DATA (test run): not handwriting, NOT FOR PUBLICATION")
+            return [gen(self, spec) for spec in self.specs]
         if dc.source not in ("hf", "local"):
             raise ValueError(f"unknown cfg.data.source '{dc.source}'")
         out = []
         for spec in self.specs:
-            if spec.key == "synthetic":
-                raise RuntimeError("the 'synthetic' corpus is only available with cfg.data.source='synthetic' (Config.smoke())")
+            if not (spec.hf_dataset or spec.local_dir or dc.source == "local"):
+                raise RuntimeError(f"corpus '{spec.key}' has neither a Hub dataset nor a local folder")
             out.append(self._load_spec_cached(spec))
         return out
 
@@ -1082,7 +1030,7 @@ class HandwritingDataModule:
                         "n": len(src), "sel": hashlib.sha1(np.asarray(sel, np.int64).tobytes()).hexdigest(), "H": dc.img_height,
                         "max_w": dc.max_img_width, "min_w": dc.min_img_width, "pad_x": dc.pad_x, "ink": bool(dc.cache_images),
                         "crop": bool(dc.crop_ink_band), "v": 3}
-                real = spec.key != "synthetic" and not self.is_synthetic
+                real = not self.is_synthetic
                 build = (lambda ink_path, src=src, sel=sel, spec=spec, k=k, real=real: build_line_cache(
                     src, sel, dc.img_height, dc.max_img_width, dc.min_img_width, dc.pad_x, f"decoding [{spec.key}/{k}]", dc.cache_images, ink_path,
                     dc.crop_ink_band, decode_workers(dc.decode_workers, len(sel)) if real else 0))

@@ -27,6 +27,7 @@ Fixed (full list with locations in `docs/AUDIT_v10_to_v11.md`)
 * The Kaggle notebook is one READABLE cell with the complete code (sections in reading order, table of contents), generated from the package; run processes execute the cell's own source.
 * Plan robustness (Kaggle log: every run on GPU 0 aborted with exit code -6 within 20 s): GPU check per GPU, corpus preparation in a CPU-only process, spawn instead of fork for decoding, fault handler in run processes, the end of a failed run's log in the notebook, a stop after repeated failures, `dry_run`.
 * Kaggle (torch 2.11, CUDA 13.0, T4): the leakage probe is fitted on the CPU (no GPU linear-algebra solver in training); worker processes record their error and exit without teardown (a broken CUDA context aborted them before the error was saved); the GPU check covers every operation of a training step.
+* The notebook is independent of the repository: no file or package reference (the build fails otherwise), no test code, no generated data; the line generator and the tiny test configuration (`smoke_config`) moved to the repository tests; `run.self_test` and mode `smoke` were removed from the runtime (tests: `pytest`, `pytest -m slow`).
 * Training curves gained FRAG-RC panels (trusted share, per-cell coverage, realised error of trusted characters).
 * The suite summary reports WER, post-hoc and system CER, a component-contribution table, and can re-aggregate without retraining.
 

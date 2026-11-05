@@ -432,7 +432,7 @@ def build_paper(plan, runs: Sequence[Dict[str, Any]], state: Dict[str, Dict[str,
     if t10:
         docs.append(_write_table(out, "T10_compute", "Training budget and compute (NVIDIA T4)", ["stage", "epoch budget", "epochs trained (mean)",
                                  "best epoch (mean)", "complexity", "finished runs", "GPU-h per run", "GPU-h total"], t10,
-                                 "Epoch budget from inklingua/schedule.py (IAM reproduces the v10 defaults); training stops early on val_sel."))
+                                 "Epoch budget from the training-budget rule (IAM reproduces the v10 defaults); training stops early on val_sel."))
 
     with open(os.path.join(out, "RESULTS.md"), "w", encoding="utf-8") as f:
         f.write("\n".join(docs) + "\n\n### Figures\n\n![label budget](figures/label_budget.png)\n\n![ablations](figures/ablation_heatmap.png)\n")
@@ -473,7 +473,7 @@ def _write_repro(plan, rows, out) -> None:
     p = os.path.join(plan.work_dir, "_plan", "code_sha256.txt")
     if os.path.exists(p):
         code_sha = open(p).read().strip()
-    L = [f"# Reproducibility\n\nInkLingua v{__version__}; code sha256 `{code_sha or 'n/a'}` (the notebook cell, or the repository archive); torch {torch.__version__}; CUDA {torch.version.cuda}; "
+    L = [f"# Reproducibility\n\nInkLingua v{__version__}; code sha256 `{code_sha or 'n/a'}` (the executed code); torch {torch.__version__}; CUDA {torch.version.cuda}; "
          f"Python {platform.python_version()}; LLM `{plan.llm_name}`; seeds {list(plan.seeds)}; main label budget {int(100 * plan.labeled_fraction)} %.\n",
          "## Datasets\n", "| key | Hub dataset | pinned revision | resolved commit | language / script / era | split sizes | caps |", "|---|---|---|---|---|---|---|"]
     for k in dict.fromkeys(list(plan.corpora) + (list(plan.joint_corpora) if plan.joint else [])):
@@ -484,7 +484,7 @@ def _write_repro(plan, rows, out) -> None:
     if "_joint_decontamination" in prov:
         L.append(f"\nJoint-stage decontamination (exact image digests): {prov['_joint_decontamination']}.\n")
     L += ["\n## Training budget rule\n", f"S = {REF_STEPS:,} x sqrt(N_train / {REF_LINES:,}) x k_script x k_era; epochs = clip(ceil(S / steps per epoch), {MIN_EPOCHS}, {MAX_EPOCHS}); "
-          f"k_script = {SCRIPT_FACTOR}; k_era = {ERA_FACTOR}.  Patience, warm-ups and refresh intervals scale with the epoch budget (inklingua/schedule.py).\n",
+          f"k_script = {SCRIPT_FACTOR}; k_era = {ERA_FACTOR}.  Patience, warm-ups and refresh intervals scale with the epoch budget (training-budget rule).\n",
           "| stage | train lines | complexity | epoch budget | steps / epoch |", "|---|---|---|---|---|"]
     for stage, sources in stage_list(plan):
         b = stage_schedule(plan, stage, sources)

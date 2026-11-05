@@ -36,7 +36,6 @@ In a notebook cell:
 
 ```python
 from inklingua import Config, main
-main(Config.smoke())                                   # synthetic plumbing test, a few minutes on CPU
 main()                                                 # IAM-line, 30 % labels, FRAG-RC + WSD
 cfg = Config(); cfg.run.mode = "suite"; main(cfg)      # baselines + ablations x 3 seeds -> suite_summary.md (what a paper needs)
 main(Config.multi(("iam", "rimes", "khatt")))          # English + French + Arabic (right-to-left) at once
@@ -46,7 +45,8 @@ cfg.train.init_from = "inklingua_runs/inklingua_iam/checkpoints/best.pt"; cfg.da
 
 **The article's experiments (Kaggle GPU T4 x2):** `notebooks/InkLingua_Kaggle_T4x2.ipynb` is ONE readable cell that contains the whole
 code -- every class and function of the package, one section per module in reading order, with a table of contents -- and one entry
-point (`notebook_main`).  Each run executes in its own process from the cell's own source, written to `_plan/inklingua_notebook.py`.  It runs
+point (`notebook_main`).  It is self-contained: it needs neither this repository nor any package of it, and contains no test code
+and no generated data.  Each run executes in its own process from the cell's own source, written to `_plan/inklingua_notebook.py`.  It runs
 the complete experiment plan on the real corpora (5 core variants, 14 training ablations and a label-budget sweep, for every corpus and 3
 seeds; then a joint model and a zero-shot adaptation stage), two runs in parallel on the two T4s, and resumes in the next session.  It
 writes the paper tables (Markdown, LaTeX, CSV), figures, statistics and a reproducibility report.  See `docs/EXPERIMENT_PLAN.md`,
@@ -56,13 +56,13 @@ first corpus in minutes).  The package is the source of truth; regenerate the no
 
 There is no argparse: every option is a dataclass default in `inklingua/config.py`.  Modes: `single`, `suite`,
 `suite_summary`, `finetune`, `adapt` / `adapt_curve` / `source_calib` (zero-shot adaptation to a folder of line images in a
-new language), `report` (rebuild the report of an existing run), `smoke`.
+new language), `report` (rebuild the report of an existing run).  Repository tests: `pytest` (fast) and `pytest -m slow` (end-to-end smoke).
 
 ## What is where
 
 | module | question it answers |
 |---|---|
-| `inklingua/config.py` | every option; `Config.labeled_only()`, `Config.ablation(...)`, `Config.multi(...)`, `Config.smoke()` |
+| `inklingua/config.py` | every option; `Config.labeled_only()`, `Config.ablation(...)`, `Config.multi(...)` |
 | `inklingua/datasets_registry.py` | 12 free line-level corpora with the IAM-line schema, verified on the Hub (`docs/DATASETS.md`) |
 | `inklingua/text.py` | grapheme-cluster codec, right-to-left handling, IAM detokenisation, CER / WER / chrF, form-clustered bootstrap |
 | `inklingua/data.py` | preprocessing, Hub / local / synthetic sources, the dataset serving both tasks, MixLine, the multi-corpus data module |

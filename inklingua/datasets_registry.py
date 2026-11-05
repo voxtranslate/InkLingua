@@ -63,8 +63,6 @@ DATASETS: Dict[str, DatasetSpec] = {
         key="khatt", hf_dataset="Teklia/KHATT_v1.0", hf_revision="7da941f6705364c085107c75af4f75e5d421fa4e", language="ar",
         script="Arabic", rtl=True, expected_sizes=(4672, 963, 1038), licence="no Hub tag; KHATT: free research use",
         note="Modern Arabic (KHATT v1.0); text in LOGICAL order -> rtl=True converts it to visual order for the recogniser."),
-    # the synthetic corpus of Config.smoke(): generated fake handwriting, plumbing tests only
-    "synthetic": DatasetSpec(key="synthetic", hf_dataset="", language="en", script="Latin", note="SYNTHETIC smoke-test data."),
 }
 
 

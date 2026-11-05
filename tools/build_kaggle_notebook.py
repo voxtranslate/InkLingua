@@ -60,7 +60,7 @@ HEADER = r'''# =================================================================
 #    Cost: the full plan is ~2,300 T4 GPU-hours (~100 sessions).  PLAN_OVERRIDES narrows it, e.g. {"seeds": (1337,)} (one third);
 #    {"dry_run": True} only checks the GPUs and prepares the first corpus (minutes) -- a good first session.
 #
-#  CONTENTS (one section per module of the repository, in dependency order)
+#  CONTENTS (one section per component, in reading order)
 {toc}
 # ======================================================================================================================================
 from __future__ import annotations
@@ -288,9 +288,55 @@ def render_imports(imports: Dict[str, Set[Tuple[str, ...]]]) -> str:
             "import matplotlib.pyplot as plt  # noqa: E402\n" + "\n".join(sorted(set(plain["third"]))) + "\n")
 
 
+# ======================================================================================================================================
+# the notebook is self-contained: section names instead of file names, nothing that points to the repository
+# ======================================================================================================================================
+TITLES = {"utils": "Utilities", "config": "Configuration", "datasets_registry": "Dataset registry", "text": "Text and metrics",
+          "style": "Style descriptors", "decoding": "CTC decoding", "alphabet": "Alphabet growth", "data": "Data", "model": "Model",
+          "riskcontrol": "Risk control", "frag": "FRAG-RC", "pseudo": "Line-level pseudo-labels (baseline)", "llm": "Language model",
+          "curves": "Training curves", "render": "Style-matched rendering", "protocol": "Evaluation protocol", "explain": "Explanations",
+          "posthoc": "Post-hoc options", "interpret": "Interpretability", "inferencer": "Inference", "report": "Run report",
+          "trainer": "Training", "schedule": "Training budget", "main": "Single-run entry point", "adapt": "Adaptation", "suite": "Suite",
+          "paper": "Paper outputs", "experiments": "Experiment plan"}
+
+FORBIDDEN = (r"github", r"\brepositor", r"inklingua/", r"\binklingua\.(?!py\b)", r"\binklingua\.py\b", r"docs/", r"\bpytest\b", r"selftest",
+             r"self-test", r"\btests/", r"git clone", r"Config\.smoke")
+
+PACKAGE_WORKER_ENTRY = (
+    "# How a run process is started.  The repository runs the package module; the single-cell notebook writes its own source to a file and\n"
+    "# sets WORKER_ENTRY = [that file].  -X faulthandler: a native crash (SIGABRT / SIGSEGV) prints the Python stack into the run's log.\n"
+    'WORKER_ENTRY: List[str] = ["-m", "inklingua.experiments"]')
+NOTEBOOK_WORKER_ENTRY = (
+    "# How a run process is started: notebook_main() writes the source of this cell to a file and sets WORKER_ENTRY = [that file].\n"
+    "# -X faulthandler: a native crash (SIGABRT / SIGSEGV) prints the Python stack into the run's log.\n"
+    "WORKER_ENTRY: List[str] = []")
+
+
+def neutral_text(src: str) -> str:
+    """Rewrite the package's references to its own files and documents into references to sections of this notebook."""
+    def section(m: re.Match) -> str:                    # only known components; anything else is left for check_independent to report
+        return f'section "{TITLES[m.group(1)]}"' if m.group(1) in TITLES else m.group(0)
+    if PACKAGE_WORKER_ENTRY not in src:
+        raise SystemExit("the worker-entry block of the experiment plan was not found (update PACKAGE_WORKER_ENTRY)")
+    src = src.replace(PACKAGE_WORKER_ENTRY, NOTEBOOK_WORKER_ENTRY)
+    src = src.replace(" (all tested in inklingua.selftest)", "")
+    src = re.sub(r"\s*\(docs/[A-Za-z_]+\.md[^)]*\)", "", src)
+    src = re.sub(r"\binklingua\.(\w+)\.(\w+)", r"\2", src)
+    src = re.sub(r"\binklingua\.(\w+)\b", section, src)
+    src = re.sub(r"\binklingua/(\w+)\.py\b", section, src)
+    return src
+
+
+def check_independent(src: str) -> None:
+    """Refuse to write a notebook that still refers to the repository."""
+    bad = [(p, m.group(0), src.count("\n", 0, m.start()) + 1) for p in FORBIDDEN for m in re.finditer(p, src, flags=re.I)]
+    if bad:
+        raise SystemExit("the notebook still refers to the repository:\n" + "\n".join(f"  line {ln}: {t!r}   ({p})" for p, t, ln in bad[:40]))
+
+
 def toc_line(name: str, doc: str) -> str:
     first = " ".join(doc.strip().split("\n\n")[0].split())
-    return f"#    {name:<18} {textwrap.shorten(first, 110, placeholder=' ...')}"
+    return f"#    {name:<42} {textwrap.shorten(first, 90, placeholder=' ...')}"
 
 
 def build_source() -> str:
@@ -299,8 +345,9 @@ def build_source() -> str:
     order = module_order()
     for k, name in enumerate(order, 1):
         doc, body = flatten_module(name, imports)
-        toc.append(toc_line(f"{k:2d}. {name}", doc))
-        banner = [BAR, f"#  {k}. {name.upper()}   (repository: inklingua/{name}.py)", BAR]
+        title = TITLES.get(name, name)
+        toc.append(toc_line(f"{k:2d}. {title}", doc))
+        banner = [BAR, f"#  {k}. {title.upper()}", BAR]
         if doc:
             banner += ["#  " + line if line.strip() else "#" for line in doc.strip().splitlines()]
             banner.append(BAR)
@@ -308,6 +355,8 @@ def build_source() -> str:
     version = re.search(r'__version__ = "([^"]+)"', open(os.path.join(PKG, "__init__.py")).read()).group(1)
     header = HEADER.replace("{toc}", "\n".join(toc))
     src = (header + render_imports(imports) + SETTINGS + f'\n__version__ = "{version}"\n\n\n' + "\n\n\n".join(sections) + "\n" + FOOTER)
+    src = neutral_text(src)
+    check_independent(src)
     return src
 
 

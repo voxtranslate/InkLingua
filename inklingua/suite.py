@@ -19,7 +19,7 @@ import numpy as np
 
 from .config import SUITE_PRESETS, Config
 from .text import paired_bootstrap_delta
-from .utils import json_safe, LOG, repository_selftests
+from .utils import json_safe, LOG
 
 
 def _read_edits(path: str) -> Dict[int, Tuple[int, int, int]]:
@@ -125,14 +125,11 @@ def _member_pred_path(c: Config) -> str:
 
 
 def run_suite(cfg: Optional[Config] = None, train: bool = True) -> Dict[str, Any]:
-    """Every run has its own directory and resumes if interrupted, so the suite can be re-launched until it is complete.  The self-tests run once."""
+    """Every run has its own directory and resumes if interrupted, so the suite can be re-launched until it is complete."""
     from .main import main
     cfg = cfg or Config()
     base = copy.deepcopy(cfg)
     base.run.mode = "single"
-    if cfg.run.self_test and train:
-        repository_selftests().run_self_tests()
-    base.run.self_test = False
     runs: Dict[str, Dict[int, str]] = {}
     for v in suite_variants(cfg):
         for s in cfg.run.suite_seeds:

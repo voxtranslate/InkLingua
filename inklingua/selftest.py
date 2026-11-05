@@ -1,13 +1,13 @@
 """
-Fast invariant tests (CPU, no download, no real data) and the synthetic end-to-end smoke.
+Fast invariant tests (CPU, no download, no real data) and the end-to-end smoke on GENERATED lines.  Repository tests only: a real run, the
+experiment plan and the Kaggle notebook never use this module or its generated data.
 
-`run_self_tests()` runs before every real run (cfg.run.self_test) and guards what a reader of the paper has to be able to trust: decoding and
-metrics are right, padding does not change a prediction, the style-equivariant targets follow the geometry, hidden transcriptions cannot reach
-training, the alphabet is grapheme-cluster based and RTL-safe, the trust rules do what they say, warm starts preserve the function.
+`run_self_tests()` guards what a reader of the paper has to be able to trust: decoding and metrics are right, padding does not change a
+prediction, the style-equivariant targets follow the geometry, hidden transcriptions cannot reach training, the alphabet is grapheme-cluster
+based and RTL-safe, the trust rules do what they say, warm starts preserve the function, a resumed run is bit-identical.
 
-`run_smoke()` trains a tiny model on SYNTHETIC lines, resumes, evaluates, builds the report (minutes on CPU).  It is NOT part of run_self_tests
-(v10 ran it inside the self-tests, which cost every real run minutes of synthetic training and redirected its log handlers into a temporary
-directory that was then deleted); run it with `mode="smoke"` or `tests/test_smoke.py`.
+`run_smoke()` trains a tiny model on generated lines, resumes, evaluates, builds the report (minutes on CPU): `tests/test_smoke.py`.
+The line generator and the tiny configuration (`smoke_config`) live here, registered in data.GENERATED_SOURCES at import.
 """
 from __future__ import annotations
 
@@ -22,16 +22,18 @@ import tempfile
 import time
 import unicodedata
 from types import SimpleNamespace
-from typing import Any, Dict
+from typing import Any, Dict, List, Tuple
 
+import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image, ImageFont
+from PIL import Image, ImageDraw, ImageFont
 
 from .alphabet import extend_codec, extend_ctc_heads, resolve_variants, visual_base_of
 from .config import SUITE_PRESETS, Config, DatasetSpec
-from .data import Collator, HandwritingDataModule, ListSource, font_paths, preprocess_line, to_u8
+from .data import GENERATED_SOURCES, Collator, HandwritingDataModule, SplitSource, font_paths, load_font, preprocess_line, to_u8
+from .datasets_registry import DATASETS
 from .decoding import ctc_prefix_beam_search, decode_with_space_bonus, greedy_decode, greedy_runs
 from .explain import adapt_bn_state, bn_layers, code_char_stats, contrast_rollout, load_bn, snapshot_bn
 from .frag import FragModel, cell_theta, char_evidence, char_wrong_labels, fragment_mask
@@ -49,6 +51,112 @@ from .trainer import Trainer, warm_start
 from .utils import LOG, restore_logging
 
 RELIABILITY_N = 10
+
+
+
+# ==============================================================================
+# generated lines (tests only) and the tiny test configuration
+# ==============================================================================
+_SYN_WORDS = ("the of and to in is that it was for on are with as his they be at one have this from or had by "
+              "hot word but what some we can out other were all there when up use your how said an each she "
+              "which do their time if will way about many then them write would like so these her long make "
+              "thing see him two has look more day could go come did number sound no most people my over know "
+              "water than call first who may down side been now find head stand own page should country found "
+              "answer school grow study still learn plant cover food sun four between state keep eye never last "
+              "let thought city tree cross farm hard start might story saw far sea draw left late run").split()
+
+
+
+def render_synthetic_line(text: str, rng: random.Random, fonts: List[str]) -> Image.Image:
+    """Offline 'handwriting': varied fonts / slant / stroke / blur / noise (for smoke tests only)."""
+    font = load_font(rng.choice(fonts) if fonts else None, rng.randint(40, 56))
+    stroke = rng.choice([0, 0, 1, 2])
+    ink = int(rng.uniform(0, 90))
+    tmp = ImageDraw.Draw(Image.new("L", (8, 8)))
+    x0, y0, x1, y1 = tmp.textbbox((0, 0), text, font=font, stroke_width=stroke)
+    w = (x1 - x0) + 60
+    canvas = Image.new("L", (w, 128), 255)
+    ImageDraw.Draw(canvas).text((30 - x0, 64 - (y1 - y0) // 2 - y0), text, font=font, fill=ink, stroke_width=stroke, stroke_fill=ink)
+    shear = rng.uniform(-0.35, 0.35)
+    canvas = canvas.transform(canvas.size, Image.AFFINE, (1, shear, -shear * 64, 0, 1, 0), resample=Image.BILINEAR, fillcolor=255)
+    arr = np.asarray(canvas, np.float32)
+    arr = cv2.GaussianBlur(arr, (0, 0), rng.uniform(0.3, 1.1))
+    arr = np.clip(arr + np.random.RandomState(rng.randint(0, 10 ** 6)).normal(0, rng.uniform(1, 6), arr.shape), 0, 255)
+    return Image.fromarray(arr.astype(np.uint8))
+
+
+class SyntheticSource(SplitSource):
+    def __init__(self, n: int, seed: int, words: Tuple[int, int] = (3, 6)):
+        rng, fonts = random.Random(seed), font_paths()
+        self._texts = [" ".join(rng.choice(_SYN_WORDS) for _ in range(rng.randint(*words))) for _ in range(n)]
+        self._imgs = [render_synthetic_line(t, rng, fonts) for t in self._texts]
+
+    def __len__(self): return len(self._texts)
+    def image(self, j): return self._imgs[int(j)]
+    def text(self, j): return self._texts[int(j)]
+
+
+class ListSource(SplitSource):
+    """Tiny in-memory split rendered from a list of texts (self-tests)."""
+
+    def __init__(self, texts: List[str], seed: int = 0):
+        rng, fonts = random.Random(seed), font_paths()
+        self._t = list(texts)
+        self._im = [render_synthetic_line(t, rng, fonts) for t in texts]
+
+    def __len__(self): return len(self._t)
+    def image(self, j): return self._im[int(j)]
+    def text(self, j): return self._t[int(j)]
+
+
+def smoke_config(work_dir: str = "./inklingua_smoke") -> Config:
+    """Tiny SYNTHETIC configuration used to validate the whole pipeline offline.  Its numbers mean nothing scientifically;
+    outputs are stamped as such."""
+    c = Config()
+    c.run.name, c.run.work_dir, c.run.smoke_test = "smoke", work_dir, True
+    c.train.auto_schedule = False
+    c.data.line_cache_dir = None
+    c.data.source, c.data.sources = "synthetic", ("synthetic",)
+    c.data.img_height, c.data.max_img_width, c.data.pad_x = 32, 512, 4
+    c.data.batch_size, c.data.eval_batch_size, c.data.num_workers = 16, 16, 0
+    c.data.synthetic_sizes, c.data.labeled_fraction = (1200, 48, 48), 0.5
+    c.data.synthetic_words = (2, 3)
+    c.data.train_eval_subset = 48
+    c.model.channels, c.model.d_model, c.model.heads = (8, 16, 32, 48), 64, 4
+    c.model.ffn, c.model.enc_layers = 128, 2
+    c.model.low_dim, c.model.codes_low, c.model.codes_high, c.model.style_dim = 32, 32, 64, 32
+    c.train.epochs, c.train.lr, c.train.warmup_steps = 24, 2e-3, 60
+    c.train.aug_tilt_px = 1.5
+    c.train.aux_start_epoch, c.train.aux_ramp_epochs = 5, 5
+    c.train.vq_start_epoch, c.train.vq_anneal_epochs = 5, 5
+    c.train.save_every, c.train.noise_eval_samples = 4, 30
+    c.train.pseudo.warmup_epochs, c.train.pseudo.refresh_every = 10, 3
+    c.train.pseudo.min_stability, c.train.pseudo.target_cer, c.train.pseudo.min_calib = 0, 0.12, 30
+    c.train.frag.warmup_epochs, c.train.frag.refresh_every, c.train.frag.min_chars, c.train.frag.diag_lines = 8, 4, 30, 40
+    c.train.frag.target_err, c.train.mixline_prob = 0.12, 0.2
+    c.data.val_block = 8
+    c.infer.wsd_steps, c.infer.wsd_min_lines, c.infer.wsd_clusters, c.infer.wsd_batch = (3, 6), 6, 2, 8
+    c.train.patience, c.train.leak_queue = 0, 256
+    c.data.calib_fraction = 0.15
+    c.train.pseudo.llm_refine = False
+    c.llm.backend = "dummy"
+    c.infer.n_vis, c.infer.n_translate, c.infer.ig_steps = 3, 4, 4
+    c.infer.pl_diag_samples, c.infer.occl_window, c.infer.occl_stride = 60, 16, 8
+    c.infer.llm_rescoring, c.infer.bootstrap = False, 200
+    c.infer.probe_lines, c.infer.mc_dropout_samples, c.infer.uncertainty_lines = 48, 3, 48
+    c.infer.counterfactual_lines, c.infer.neighbour_queries, c.infer.longline_pairs = 2, 2, 20
+    return c
+
+
+def _generated_source(dm: HandwritingDataModule, spec: DatasetSpec) -> Dict[str, SplitSource]:
+    """The 'synthetic' source of smoke_config(): generated lines, sizes / words per line from cfg.data.synthetic_* (test attributes)."""
+    sizes, words, s = getattr(dm.dc, "synthetic_sizes", (600, 120, 120)), getattr(dm.dc, "synthetic_words", (3, 6)), dm.cfg.run.seed
+    dm.provenance.setdefault("sources", {})[spec.key] = {"synthetic": True, "sizes": list(sizes)}
+    return {"train": SyntheticSource(sizes[0], s, words), "val": SyntheticSource(sizes[1], s + 1, words), "test": SyntheticSource(sizes[2], s + 2, words)}
+
+
+DATASETS.setdefault("synthetic", DatasetSpec(key="synthetic", hf_dataset="", language="en", script="Latin", note="generated test lines"))
+GENERATED_SOURCES["synthetic"] = _generated_source
 
 
 def run_self_tests(verbose: bool = True) -> None:
@@ -148,7 +256,7 @@ def run_self_tests(verbose: bool = True) -> None:
     ok("line preprocessing")
 
     # ---- model: padding invariance (train and eval), hidden states ------------------------------------------------------------
-    mc = copy.deepcopy(Config.smoke().model)
+    mc = copy.deepcopy(smoke_config().model)
     mc.dropout, mc.layer_drop = 0.0, 0.0
     torch.manual_seed(0)
     net = InkLinguaNet(mc, 30, NUM_DESC, 10, 32)
@@ -215,7 +323,7 @@ def run_self_tests(verbose: bool = True) -> None:
         pred = transform_slant_deg(torch.from_numpy(d0[:, 0]), sh, rot, vs).numpy()
         fin = np.isfinite(d1[:, 0]) & np.isfinite(pred)
         assert fin.sum() >= B // 2 and abs((d1[fin, 0] - pred[fin]).mean()) < 1.5
-    tc = copy.deepcopy(Config.smoke().train)
+    tc = copy.deepcopy(smoke_config().train)
     tc.aug_geom_prob, tc.aug_hscale_prob, tc.aug_elastic_prob, tc.aug_morph_prob, tc.aug_blur_prob = 1.0, 1.0, 0.0, 0.0, 0.0
     with np.errstate(all="ignore"):
         mu_, sd_ = np.nanmean(d0, 0), np.maximum(np.nanstd(d0, 0), STYLE_FLOORS)
@@ -267,7 +375,7 @@ def run_self_tests(verbose: bool = True) -> None:
     # ---- data module: hidden labels, calibration lines, alphabet, multi-corpus + RTL, provenance, synthetic guard ------------------
     texts = [f"{chr(0x100 + i) * 3} ab" for i in range(40)]
     tmp = tempfile.mkdtemp()
-    c = Config.smoke(tmp)
+    c = smoke_config(tmp)
     c.data.labeled_fraction, c.data.max_text_len = 0.5, 30
     dm = HandwritingDataModule(c)
     dm._load_sources = lambda: [{"train": ListSource(texts, 1), "val": ListSource(texts[:8], 2), "test": ListSource(texts[8:16], 3)}]   # type: ignore
@@ -296,17 +404,17 @@ def run_self_tests(verbose: bool = True) -> None:
     assert int(batch["target_len"].sum()) == sum(len(dm.codec.encode(tr.oracle[i])) for i in np.flatnonzero(tr.labeled))
     assert all(o == "" for o, l in zip(batch["oracle"], batch["labeled"].tolist()) if not l)
     assert dm.val_ds.reference(0) == texts[0] and os.path.exists(os.path.join(c.run_dir, "provenance.json"))
-    c2 = Config.smoke(tmp)
+    c2 = smoke_config(tmp)
     c2.run.smoke_test = False
     try:
         HandwritingDataModule(c2)._load_sources()
-        raise AssertionError("synthetic data must be refused outside Config.smoke()")
+        raise AssertionError("synthetic data must be refused outside smoke_config()")
     except RuntimeError:
         pass
     # two corpora, one of them right-to-left: domains, visual order, display, per-domain strata, MixLine within a corpus only
     ar_lines = ["سلام عليكم يا صديقي", "كتاب على الطاولة", "ذهب الولد الى المدرسة", "القط ينام في الحديقة"] * 10
     en_lines = ["the cat sat on the mat", "a quick brown fox", "hello world again", "pack my box with jugs"] * 10
-    c3 = Config.smoke(tmp)
+    c3 = smoke_config(tmp)
     c3.data.sources, c3.data.labeled_fraction, c3.data.max_text_len = ("synthetic", "arabic_test"), 0.6, 40
     c3.data.custom_sources = (DatasetSpec(key="arabic_test", language="ar", script="Arabic", rtl=True),)
     c3.train.frag.strata = 2
@@ -376,7 +484,7 @@ def run_self_tests(verbose: bool = True) -> None:
     assert abs(ad_["a"][0][0] - 2.0) < 1e-9 and abs(ad_["a"][1][0] - 2.0) < 1e-9
     lps_ = np.log(np.array([[0.1, 0.8, 0.1], [0.5, 0.1, 0.4], [0.9, 0.05, 0.05]]))
     assert decode_with_space_bonus(lps_, 2, 0.0) == [1] and decode_with_space_bonus(lps_, 2, 1.5) == [1, 2] and decode_with_space_bonus(lps_, None, 9.0) == [1]
-    cm = Config.smoke().model
+    cm = smoke_config().model
     net_ = InkLinguaNet(cm, 24, NUM_DESC, 4, 32).eval()
     for _, m_ in bn_layers(net_):
         m_.running_mean.normal_(0, 0.5), m_.running_var.uniform_(0.5, 2.0)
@@ -464,7 +572,7 @@ def run_self_tests(verbose: bool = True) -> None:
     uc0 = CharCodec(sorted(kn))
     uc1, gr = extend_codec(uc0, "éèà " + Eg + "ɛж́")
     assert uc1.units[:len(uc0.units)] == uc0.units and gr.orphans == [uc1.c2i["ж́"]]
-    net8 = InkLinguaNet(Config.smoke().model, uc0.num_classes, NUM_DESC, 4, 32).eval()
+    net8 = InkLinguaNet(smoke_config().model, uc0.num_classes, NUM_DESC, 4, 32).eval()
     x8, w8 = torch.rand(2, 1, 32, 96), torch.tensor([96, 80])
     with torch.no_grad():
         lp_old = net8(x8, w8)["log_probs"].numpy()
@@ -496,15 +604,15 @@ def run_self_tests(verbose: bool = True) -> None:
     assert resolve_variants(ids_, fr_, lp_, gr, None)[0] == "ete" and resolve_variants(ids_, fr_, lp_, gr, lm_fake, beam=1)[0] == "été"
     # warm start of a model whose alphabet EXTENDS the checkpoint's: function preserved on the old units
     tmpw = tempfile.mkdtemp()
-    small = InkLinguaNet(Config.smoke().model, uc0.num_classes, NUM_DESC, 4, 32).eval()
+    small = InkLinguaNet(smoke_config().model, uc0.num_classes, NUM_DESC, 4, 32).eval()
     torch.save({"weights": small.state_dict(), "units": uc0.units, "epoch": 1}, os.path.join(tmpw, "best.pt"))
-    big = InkLinguaNet(Config.smoke().model, uc1.num_classes, NUM_DESC, 4, 32).eval()
+    big = InkLinguaNet(smoke_config().model, uc1.num_classes, NUM_DESC, 4, 32).eval()
     info_w = warm_start(big, os.path.join(tmpw, "best.pt"), uc1)
     with torch.no_grad():
         lp_s, lp_b = small(x8, w8)["log_probs"].numpy(), big(x8, w8)["log_probs"].numpy()
     assert info_w["appended_units"] == uc1.num_classes - uc0.num_classes and np.abs(gr.collapse(lp_b)[..., :uc0.num_classes] - lp_s).max() < 1e-4
     try:
-        warm_start(InkLinguaNet(Config.smoke().model, uc1.num_classes, NUM_DESC, 4, 32), os.path.join(tmpw, "best.pt"), uc1, strict_alphabet=True)
+        warm_start(InkLinguaNet(smoke_config().model, uc1.num_classes, NUM_DESC, 4, 32), os.path.join(tmpw, "best.pt"), uc1, strict_alphabet=True)
         raise AssertionError("strict warm start must refuse a different alphabet")
     except RuntimeError:
         pass
@@ -608,7 +716,7 @@ def run_self_tests(verbose: bool = True) -> None:
     rs10 = random.Random(11)
     texts10 = ["".join(rs10.choice("abcdefgh") for _ in range(rs10.randint(8, 14))) for _ in range(400)]
     tmp10 = tempfile.mkdtemp()
-    c10 = Config.smoke(tmp10)
+    c10 = smoke_config(tmp10)
     c10.data.labeled_fraction, c10.data.max_text_len, c10.data.calib_fraction, c10.data.val_block = 0.4, 30, 0.2, 8
     dm10 = HandwritingDataModule(c10)
     dm10._load_sources = lambda: [{"train": ListSource(texts10[:320], 1), "val": ListSource(texts10[320:372], 2), "test": ListSource(texts10[372:], 3)}]   # type: ignore
@@ -717,7 +825,7 @@ def run_self_tests(verbose: bool = True) -> None:
     assert stages_in_order == list(pl.corpora) + ["joint"], stages_in_order                       # corpus after corpus
     cv = run_config(pl, next(r for r in rr if r["variant"] == "no_vq"))
     apply_budget(cv, bi)
-    assert cv.train.vq_start_epoch == 10 ** 6 and cv.llm.backend == "causal" and not cv.run.self_test and cv.data.source == "hf"
+    assert cv.train.vq_start_epoch == 10 ** 6 and cv.llm.backend == "causal" and cv.data.source == "hf"
     assert all(run_config(pl, r).llm.backend == "causal" for r in rr[:5])
     shutil.rmtree(tmpp, ignore_errors=True)
     rs_ = np.random.RandomState(0)
@@ -733,7 +841,7 @@ def run_self_tests(verbose: bool = True) -> None:
     tmpd = tempfile.mkdtemp()
     tx = [f"word{i} text" for i in range(40)]
     for deco in (False, True):
-        cd_ = Config.smoke(tmpd)
+        cd_ = smoke_config(tmpd)
         cd_.data.labeled_fraction, cd_.data.decontaminate = 0.5, deco
         dmd = HandwritingDataModule(cd_)
         dmd._load_sources = lambda: [{"train": ListSource(tx, 1), "val": ListSource(tx[20:28], 9), "test": ListSource(tx[:8], 1)}]   # type: ignore
@@ -808,7 +916,7 @@ def _test_exact_resume() -> None:
     tmp = tempfile.mkdtemp(prefix="inklingua_resume_")
     try:
         def make(name):
-            c = Config.smoke(tmp)
+            c = smoke_config(tmp)
             c.run.name = name
             c.data.synthetic_sizes = (160, 24, 24)
             c.train.epochs, c.train.min_epochs, c.train.patience = 3, 0, 0
@@ -858,8 +966,7 @@ def run_smoke(work_dir: str = None, keep: bool = False) -> Dict[str, Any]:
     Returns the metrics; the directory is deleted unless `keep`."""
     from .main import main
     tmp = work_dir or tempfile.mkdtemp(prefix="inklingua_smoke_")
-    c = Config.smoke(tmp)
-    c.run.self_test = False
+    c = smoke_config(tmp)
     c.train.epochs, c.train.frag.warmup_epochs, c.train.frag.refresh_every = 12, 4, 4
     c.train.aux_start_epoch, c.train.aux_ramp_epochs, c.train.vq_start_epoch, c.train.vq_anneal_epochs = 2, 2, 2, 2
     c.data.synthetic_sizes = (480, 64, 48)
