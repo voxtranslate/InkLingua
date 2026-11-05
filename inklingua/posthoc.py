@@ -433,7 +433,9 @@ class PosthocMixin:
         ax[1].set_title(f"errors cluster by form / writer (lag-1 corr {M['form_structure']['lag1_autocorrelation_of_line_CER']:.2f})", fontsize=9)
         for name, b in bins.items():
             ax[2].plot(range(1, 6), [r["CER"] * 100 for r in b["quintiles"]], "o-", label=f"{name} (rho {b['spearman_with_line_CER']:+.2f})")
-        ax[2].set_xlabel("quintile of the measured descriptor (1 = lowest)"), ax[2].set_ylabel("CER (%)"), ax[2].legend(fontsize=7)
+        ax[2].set_xlabel("quintile of the measured descriptor (1 = lowest)"), ax[2].set_ylabel("CER (%)")
+        if ax[2].get_legend_handles_labels()[0]:
+            ax[2].legend(fontsize=7)
         ax[2].set_title("CER by handwriting style", fontsize=9)
         self._fig("03_error_structure/error_structure.png", "Where the errors come from: character classes, forms, handwriting style", fig)
         return M

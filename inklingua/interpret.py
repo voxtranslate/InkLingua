@@ -16,6 +16,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+import warnings
 from collections import defaultdict
 from typing import Any, Dict, List, Sequence
 
@@ -292,8 +293,10 @@ class InterpretMixin:
             sims[q] = -np.inf
             nb = np.argsort(-sims)[:5]
             r = rng.randint(0, n, 5)
-            nb_diff.append(np.nanmean(np.abs(raw[nb] - raw[q]), 0))
-            rd_diff.append(np.nanmean(np.abs(raw[r] - raw[q]), 0))
+            with warnings.catch_warnings():                     # a descriptor not measurable on all of these lines is NaN, by design
+                warnings.simplefilter("ignore", RuntimeWarning)
+                nb_diff.append(np.nanmean(np.abs(raw[nb] - raw[q]), 0))
+                rd_diff.append(np.nanmean(np.abs(raw[r] - raw[q]), 0))
         with np.errstate(all="ignore"):
             nbm, rdm = np.nanmean(np.stack(nb_diff), 0), np.nanmean(np.stack(rd_diff), 0)
             ratios = {s: float(a / b) if b > 0 else float("nan") for s, a, b in zip(STYLE_NAMES, nbm, rdm)}
