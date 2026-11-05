@@ -1,0 +1,16 @@
+torch>=2.5                     # torch.amp.GradScaler("cuda"), torch.serialization.safe_globals (weights_only checkpoints)
+numpy>=1.24
+pillow>=10.1
+opencv-python-headless>=4.8
+matplotlib>=3.7
+tqdm>=4.65
+editdistance>=0.6
+datasets>=2.16
+pyarrow>=14
+# optional: the LLM in the loop (translation, N-best rescoring); the "dummy" backend needs neither
+transformers>=4.40
+accelerate>=0.27
+sentencepiece>=0.1.99
+sacremoses>=0.0.53
+# tests
+pytest>=7
