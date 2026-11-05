@@ -24,6 +24,7 @@ OUT = os.path.join(ROOT, "notebooks", "InkLingua_Kaggle_T4x2.ipynb")
 HEADER = r'''# ======================================================================================================================
 #  InkLingua - the complete experiment plan of the article.  ONE cell, ONE entry point (main() at the bottom).
 #  Kaggle: Settings -> Accelerator "GPU T4 x2", Internet "On".  Then "Save Version" -> "Save & Run All (Commit)".
+#  Optional: Add-ons -> Secrets -> a secret named HF_TOKEN (a Hugging Face read token): faster downloads, higher rate limits.
 # ======================================================================================================================
 #
 #  WHAT RUNS (real data only: the 12 corpora of the registry, pinned Hub commits; no synthetic data, no dummy model, no smoke test)
@@ -38,14 +39,17 @@ HEADER = r'''# =================================================================
 #    (inklingua/schedule.py; IAM reproduces the published defaults: 100 epochs).
 #
 #  HOW IT RUNS
-#    Two runs train in parallel, one per T4; each run is its own process (GPU memory is freed between runs) and resumes from its own
-#    checkpoint.  The session stops cleanly before Kaggle's 12-hour limit; everything finished is in /kaggle/working/inklingua_runs:
+#    Two runs train in parallel, one per T4; each run is its own process (GPU memory is freed between runs).  Every training writes a
+#    step checkpoint at least every 10 minutes and when it is stopped, and resumes EXACTLY at that step (same batches, same random state).
+#    Each corpus is downloaded once (pinned commit, offline afterwards) and decoded once in parallel into a line cache shared by all its
+#    runs; the caches of unfinished corpora are saved with the output and restored next session (no new download / decoding).
+#    The session stops cleanly before Kaggle's 12-hour limit; everything finished is in /kaggle/working/inklingua_runs:
 #      paper/RESULTS.md (+ tables/*.tex|md|csv, figures/, REPRODUCIBILITY.md, STATUS.md) - rebuilt after every finished run
 #      <corpus>/<variant>_lfXXX_sNNNN/  - each run: config, schedule, curves, checkpoints, protocol log, inference/test/00..12 folders
 #
 #  TO CONTINUE IN THE NEXT SESSION
 #    "Add Input" -> the Output of the previous version of THIS notebook, put its path in RESUME_FROM below, Save & Run All again.
-#    Finished runs are skipped, interrupted runs continue from their last epoch.  The full plan is long (see the estimate printed at the
+#    Finished runs are skipped, interrupted runs continue from the step where they stopped.  The full plan is long (see the estimate printed at the
 #    start; it is replaced by measured rates as soon as runs finish): ~70 training runs per corpus.  PLAN_OVERRIDES can narrow it.
 # ======================================================================================================================
 
@@ -71,6 +75,9 @@ def _ensure_packages():
     need = {"editdistance": "editdistance", "cv2": "opencv-python-headless", "pyarrow": "pyarrow", "huggingface_hub": "huggingface_hub",
             "transformers": "transformers", "accelerate": "accelerate", "matplotlib": "matplotlib", "tqdm": "tqdm", "datasets": "datasets",
             "sentencepiece": "sentencepiece"}
+    import torch
+    if tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2]) < (2, 5):
+        raise RuntimeError(f"torch {torch.__version__} is too old (>= 2.5 needed): choose a recent Kaggle environment")
     missing = [pip for mod, pip in need.items() if importlib.util.find_spec(mod) is None]
     if missing:
         _log(f"installing {missing}")
@@ -116,6 +123,9 @@ def main():
     code_root = _install_code()
     from inklingua import __version__
     from inklingua.experiments import PlanConfig, run_plan
+    from inklingua.utils import quiet_third_party, resolve_hf_token
+    quiet_third_party()                                  # no per-request HTTP lines, no progress bars
+    _log(f"Hugging Face Hub: {resolve_hf_token()}")      # HF_TOKEN (env or Kaggle secret) is exported to every run process
     used_h = (time.time() - SESSION_START) / 3600.0
     plan = PlanConfig(work_dir=WORK_DIR, cache_dir=CACHE_DIR, resume_from=RESUME_FROM, **PLAN_OVERRIDES)
     plan.session_hours = max(0.5, plan.session_hours - used_h)

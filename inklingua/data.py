@@ -735,6 +735,29 @@ class BucketBatchSampler(Sampler):
         yield from batches
 
 
+def _seed_worker(worker_id: int) -> None:
+    """numpy / random in a data-loader worker, seeded from the loader's generator (torch seeds itself per worker)."""
+    seed = torch.initial_seed() % 2 ** 32
+    np.random.seed(seed)
+    random.seed(seed)
+
+
+class ListBatchSampler(Sampler):
+    """A fixed list of batches (the remaining batches of a resumed epoch)."""
+
+    def __init__(self, batches: Sequence[Sequence[int]]):
+        self.batches = [list(b) for b in batches]
+
+    def set_epoch(self, e: int) -> None:
+        pass
+
+    def __len__(self) -> int:
+        return len(self.batches)
+
+    def __iter__(self):
+        yield from self.batches
+
+
 # ==============================================================================
 # the data module
 # ==============================================================================
@@ -1260,14 +1283,28 @@ class HandwritingDataModule:
     def denorm_style(self, v: np.ndarray) -> np.ndarray:
         return np.asarray(v) * self.style_std + self.style_mean
 
-    def _loader(self, ds: HandwritingDataset, sampler: BucketBatchSampler, workers: Optional[int] = None, collator=None) -> DataLoader:
+    def _loader(self, ds: HandwritingDataset, sampler: Sampler, workers: Optional[int] = None, collator=None) -> DataLoader:
+        """A loader with its OWN seeded generator: creating an iterator never draws from the global torch RNG (otherwise a run resumed in the
+        middle of an epoch -- which creates its iterator at another point of the random stream -- would diverge from an uninterrupted one),
+        and every worker seeds numpy / random from it."""
         nw = self.dc.num_workers if workers is None else workers
-        return DataLoader(ds, batch_sampler=sampler, collate_fn=collator or Collator(self.codec), num_workers=nw,
-                          pin_memory=torch.cuda.is_available(), persistent_workers=False)
+        g = torch.Generator()
+        g.manual_seed(int(self.cfg.run.seed) * 7919 + int(getattr(sampler, "epoch", 0)))
+        return DataLoader(ds, batch_sampler=sampler, collate_fn=collator or Collator(self.codec), num_workers=nw, generator=g,
+                          worker_init_fn=_seed_worker if nw > 0 else None, pin_memory=torch.cuda.is_available(), persistent_workers=False)
 
-    def train_loader(self, indices: Optional[Sequence[int]] = None) -> DataLoader:
-        """`indices` = the lines of this epoch (may contain repeats); default: every train line once."""
+    def epoch_batches(self, indices: Optional[Sequence[int]], epoch: int) -> List[List[int]]:
+        """The batches of one training epoch, in order (width-bucketed, deterministic per (seed, epoch)).  Stored in a step checkpoint, so that
+        a run resumed in the middle of an epoch sees exactly the batches it had not yet seen."""
         s = BucketBatchSampler(self.train_ds.width, self.dc.batch_size, True, self.dc.bucket_mega, seed=self.cfg.run.seed, indices=indices)
+        s.set_epoch(epoch)
+        return [list(map(int, b)) for b in s]
+
+    def train_loader(self, indices: Optional[Sequence[int]] = None, batches: Optional[Sequence[Sequence[int]]] = None) -> DataLoader:
+        """`batches` = the (remaining) batches of this epoch; else `indices` = the lines of this epoch (may contain repeats), default every
+        train line once, bucketed by width."""
+        s = (ListBatchSampler(batches) if batches is not None else
+             BucketBatchSampler(self.train_ds.width, self.dc.batch_size, True, self.dc.bucket_mega, seed=self.cfg.run.seed, indices=indices))
         tc = self.cfg.train
         nospace = [d for d, sp in enumerate(self.specs) if sp.script in ("Han",)]
         return self._loader(self.train_ds, s, collator=Collator(self.codec, mix_prob=tc.mixline_prob, max_w=self.dc.max_img_width,

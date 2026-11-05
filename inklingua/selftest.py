@@ -22,29 +22,29 @@ import tempfile
 import time
 import unicodedata
 from types import SimpleNamespace
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageFont
 
-from .alphabet import CharGroups, extend_codec, extend_ctc_heads, resolve_variants, visual_base_of
+from .alphabet import extend_codec, extend_ctc_heads, resolve_variants, visual_base_of
 from .config import SUITE_PRESETS, Config, DatasetSpec
 from .data import Collator, HandwritingDataModule, ListSource, font_paths, preprocess_line, to_u8
 from .decoding import ctc_prefix_beam_search, decode_with_space_bonus, greedy_decode, greedy_runs
 from .explain import adapt_bn_state, bn_layers, code_char_stats, contrast_rollout, load_bn, snapshot_bn
 from .frag import FragModel, cell_theta, char_evidence, char_wrong_labels, fragment_mask
-from .llm import Hypothesis, LLMEngine, calibrate_word_mark, mark_uncertain
-from .model import ClosedFormLeakage, FiLM, GPUAugment, InkLinguaNet, body_ratio_t, compute_losses, ctc_per_sample, frame_consistency, fragment_distillation, transform_slant_deg
+from .llm import LLMEngine, calibrate_word_mark, mark_uncertain
+from .model import ClosedFormLeakage, FiLM, GPUAugment, InkLinguaNet, body_ratio_t, frame_consistency, fragment_distillation, transform_slant_deg
 from .protocol import log_test_look, write_protocol
 from .pseudo import PseudoLabelBank, SelectionRule, reliability_features, reliability_views
 from .render import _baseline_y, _draw_line, render_styled_text_info, style_mismatch
-from .riskcontrol import anchor_audit, auroc, char_risk_threshold, domain_shift, pava_increasing, risk_control_threshold, risk_curve, transfer_risk_control, weighted_ks, weighted_risk_curve
+from .riskcontrol import auroc, char_risk_threshold, domain_shift, pava_increasing, risk_control_threshold, risk_curve, transfer_risk_control, weighted_ks, weighted_risk_curve
 from .style import NUM_DESC, STYLE_FLOORS, body_ratio_from_rows, compute_style_descriptors, estimate_slant_deg
 from .suite import suite_markdown, summarise_suite
-from .text import (CharCodec, bootstrap_cer_ci, cer, char_class, chrf, ctc_feasible, detokenize, edit_distance, grapheme_clusters, paired_bootstrap_delta,
-                   ridge_cv_r2, to_logical, to_visual, wer)
+from .text import (CharCodec, bootstrap_cer_ci, cer, char_class, chrf, ctc_feasible, detokenize, grapheme_clusters, paired_bootstrap_delta, ridge_cv_r2,
+                   to_logical, to_visual, wer)
 from .trainer import Trainer, warm_start
 from .utils import LOG, restore_logging
 
@@ -685,7 +685,7 @@ def run_self_tests(verbose: bool = True) -> None:
     assert pv_["mean_delta"] < 0 and pv_["seeds_better"] == 2 and sm_["contribution_vs_full"]["no_frag"]["mean_delta"] > 0 and "| full |" in suite_markdown(sm_)
     shutil.rmtree(tmp3, ignore_errors=True)
     # explainability helpers
-    rs = np.random.RandomState(0)
+    np.random.RandomState(0)
     cc2 = np.zeros((60, 30))
     for k in range(60):
         cc2[k, k % 30] = 40
@@ -785,7 +785,72 @@ def run_self_tests(verbose: bool = True) -> None:
     assert list(_tr.tqdm(_CountIt(), disable=True)) == [0, 1, 2] and _n_it["n"] == 1
     shutil.rmtree(tmpd, ignore_errors=True)
     ok("experiment plan: budget rule (IAM = v10 defaults), corpus-major plan, pooled paired bootstrap / Holm / sign test, block caps, decontamination, parquet reader, memory-mapped line cache, one loader iterator")
+    _test_exact_resume()
+    ok("exact step-level resume: a run stopped in the middle of an epoch (SIGTERM) and restarted ends with the same weights, EMA and "
+       "history as an uninterrupted run; ink-band crop of mostly blank line images")
     LOG.info("%d self-tests passed in %.1fs", len(done), time.time() - t0)
+
+
+def _test_exact_resume() -> None:
+    import signal as _signal
+    from .llm import LLMEngine
+    from .model import InkLinguaNet
+    from .trainer import Trainer
+    from .utils import restore_logging, set_seed, setup_logging, torch_load
+    # ink band: a 4 % text band in a blank page is found, a tight line crop is left alone
+    page = np.full((1000, 800), 250.0, np.float32)
+    page[100:140, 50:750] = 20.0
+    page[700:703, 300:304] = 20.0                                              # a speck far from the text
+    from .data import ink_band
+    band = ink_band(page)
+    assert band is not None and band[0] <= 100 and 140 <= band[1] < 200, band
+    assert ink_band(page[90:150]) is None
+    tmp = tempfile.mkdtemp(prefix="inklingua_resume_")
+    try:
+        def make(name):
+            c = Config.smoke(tmp)
+            c.run.name = name
+            c.data.synthetic_sizes = (160, 24, 24)
+            c.train.epochs, c.train.min_epochs, c.train.patience = 3, 0, 0
+            c.train.frag.warmup_epochs, c.train.frag.refresh_every, c.train.frag.min_chars = 1, 1, 30
+            c.llm.backend = "dummy"
+            c.make_dirs()
+            setup_logging(c)
+            set_seed(c.run.seed)
+            d = HandwritingDataModule(c).prepare()
+            m = InkLinguaNet(c.model, d.codec.num_classes, NUM_DESC, d.n_clusters, c.data.img_height)
+            return c, Trainer(c, d, m, LLMEngine(c.llm, torch.device("cpu")), torch.device("cpu"))
+        try:
+            cA, tA = make("A")
+            tA.fit()
+            A = torch_load(os.path.join(cA.ckpt_dir, "last.pt"))
+            cB, tB = make("B")
+            orig, n = Trainer._train_step, {"k": 0}
+
+            def stepper(self, *a, **k):
+                orig(self, *a, **k)
+                n["k"] += 1
+                if n["k"] == 13:                                                   # epoch 2, step 3 of 10
+                    self._stop_signal = int(_signal.SIGTERM)
+            Trainer._train_step = stepper
+            try:
+                tB.fit()
+            finally:
+                Trainer._train_step = orig
+            part = torch_load(os.path.join(cB.ckpt_dir, "last.pt"))["partial"]
+            assert tB.interrupted and (part["epoch"], part["step"]) == (1, 3), part
+            cB, tB = make("B")
+            tB.fit()
+            B = torch_load(os.path.join(cB.ckpt_dir, "last.pt"))
+        finally:
+            for _ in range(3):
+                restore_logging()
+        assert A["global_step"] == B["global_step"] and "partial" not in B
+        assert all(torch.equal(A["model"][k], B["model"][k]) for k in A["model"]), "resumed weights differ"
+        assert all(torch.equal(A["ema"][k], B["ema"][k]) for k in A["ema"]), "resumed EMA differs"
+        assert A["history"]["train_total"] == B["history"]["train_total"]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def run_smoke(work_dir: str = None, keep: bool = False) -> Dict[str, Any]:

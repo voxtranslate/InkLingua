@@ -43,12 +43,12 @@ from .llm import Hypothesis, LLMEngine, calibrate_word_mark, fuse_scores
 from .model import InkLinguaNet, ctc_per_sample
 from .posthoc import PosthocMixin
 from .protocol import log_test_look
-from .pseudo import PERTURBATIONS, RELIABILITY_FEATURES, ReliabilityModel, SelectionRule, apply_perturbation, reliability_features, reliability_views
+from .pseudo import PERTURBATIONS, ReliabilityModel, SelectionRule, apply_perturbation, reliability_features, reliability_views
 from .render import compute_style_descriptors, render_styled_text_info, render_styled_text_open_loop, style_mismatch
 from .riskcontrol import auroc, risk_control_threshold
 from .style import NUM_DESC, STYLE_NAMES
-from .text import (CharCodec, align_chars, bootstrap_cer_ci, cer, chrf, detokenize, edit_distance, grapheme_clusters, is_linguistic, paired_bootstrap_delta,
-                   paired_mean_ci, ridge_cv_r2, text_baseline_r2)
+from .text import (align_chars, bootstrap_cer_ci, cer, chrf, detokenize, edit_distance, grapheme_clusters, is_linguistic, paired_bootstrap_delta, paired_mean_ci,
+                   ridge_cv_r2, text_baseline_r2)
 from .utils import LOG, json_safe, to_device, torch_load
 
 try:
@@ -122,7 +122,7 @@ class Inferencer(PosthocMixin, InterpretMixin):
         self.fig_list.append((rel, caption))
 
     # ------------------------------------------------------------------ passes over a dataset
-    @torch.no_grad()
+    @torch.inference_mode()
     def _predict(self, ds, indices, perturb=None) -> Tuple[List[str], np.ndarray]:
         preds, conf = [""] * len(ds), np.zeros(len(ds))
         for batch in self.data.eval_loader(ds, indices):
@@ -143,7 +143,7 @@ class Inferencer(PosthocMixin, InterpretMixin):
             return sorted(int(i) for i in ids)
         return sorted(int(i) for i in np.random.RandomState(seed).permutation(ids)[:k])
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def _collect(self, ds, indices: Optional[Sequence[int]] = None, extras: bool = True, cons: bool = False, keep_lp: Optional[Sequence[int]] = None) -> Dict[str, Any]:
         """One pass: readings (visual order), confidences, reliability features, style predictions, embeddings, codebook usage.  `ds.oracle` is
         read directly (evaluation code); for unlabeled TRAIN lines it is the hidden transcription, used for diagnostics only."""
@@ -852,7 +852,7 @@ class Inferencer(PosthocMixin, InterpretMixin):
         return res
 
     # ------------------------------------------------------------------ [LLM-N] constrained LLM rescoring
-    @torch.no_grad()
+    @torch.inference_mode()
     def _nbest_pass(self, ds, indices) -> Dict[int, Dict[str, Any]]:
         res: Dict[int, Dict[str, Any]] = {}
         codec = self.data.codec
@@ -1113,7 +1113,7 @@ class Inferencer(PosthocMixin, InterpretMixin):
         return metrics
 
     # ------------------------------------------------------------------ report extras (what only the model can supply)
-    @torch.no_grad()
+    @torch.inference_mode()
     def _evidence_pass(self, ds, ids: Sequence[int], view: str = "shear +0.08"):
         self.model.eval()
         for batch in self.data.eval_loader(ds, [int(i) for i in ids]):

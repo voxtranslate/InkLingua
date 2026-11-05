@@ -32,7 +32,7 @@ from .utils import LOG, to_device
 
 class PosthocMixin:
     # ------------------------------------------------------------------ frame posteriors with optional per-group BN statistics
-    @torch.no_grad()
+    @torch.inference_mode()
     def _lp_pass(self, ds, indices: Sequence[int], assign: Optional[Dict[int, int]] = None,
                  states: Optional[Dict[int, Dict[str, Tuple[np.ndarray, np.ndarray]]]] = None, view: Optional[str] = None) -> Dict[int, np.ndarray]:
         """Frame log-posteriors (valid frames only) of the given lines; with `assign` / `states` every line is read by the model that carries
@@ -277,7 +277,7 @@ class PosthocMixin:
         return res
 
     # ------------------------------------------------------------------ [WSD]
-    @torch.no_grad()
+    @torch.inference_mode()
     def _read_with(self, model: nn.Module, ds, lines: Sequence[int]) -> Dict[int, np.ndarray]:
         res: Dict[int, np.ndarray] = {}
         model.eval()

@@ -17,7 +17,7 @@ import csv
 import json
 import os
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -82,7 +82,7 @@ def _ridge_r2_cv(X: np.ndarray, y: np.ndarray, folds: int = 2, lam: float = 1.0,
 
 class InterpretMixin:
     # ------------------------------------------------------------------ layer probes
-    @torch.no_grad()
+    @torch.inference_mode()
     def _layer_probes(self, ds, ids: Sequence[int], folder: str) -> Dict[str, Any]:
         """Hidden states after every encoder layer at the EMITTING frames (label = the emitted unit) -> linear probe accuracy per layer;
         mean-pooled hidden states -> linear R2 of the measured slant per layer.  Shows where content and style are represented."""
@@ -222,7 +222,7 @@ class InterpretMixin:
         return res
 
     # ------------------------------------------------------------------ character counterfactuals
-    @torch.no_grad()
+    @torch.inference_mode()
     def _counterfactuals(self, ds, ids: Sequence[int], folder: str) -> List[Dict[str, Any]]:
         """Erase the ink of one emitted character (its CTC frames x 4 px) and read again: which characters of the reading change?  A character
         that changes when ANOTHER one is erased depends on context (good for words, bad for isolated glyphs); the diagonal is the character's
@@ -314,7 +314,7 @@ class InterpretMixin:
         return {"neighbour_vs_random_descriptor_gap_ratio": ratios, "note": "< 1 means embedding neighbours have more similar measured style than random pairs"}
 
     # ------------------------------------------------------------------ alignments
-    @torch.no_grad()
+    @torch.inference_mode()
     def _export_alignments(self, ds, ids: Sequence[int], path: str) -> int:
         """01_recognition/alignments.jsonl: the CTC alignment of every line (character, first / end frame, pixel span, peak confidence)."""
         codec = self.data.codec
@@ -337,7 +337,7 @@ class InterpretMixin:
         return n
 
     # ------------------------------------------------------------------ long-line stress test
-    @torch.no_grad()
+    @torch.inference_mode()
     def _longline_stress(self, ds, R: Dict[str, Any], folder: str) -> Dict[str, Any]:
         """Pairs of test lines of the same corpus are concatenated (12 px gap) and read as one line; the CER of the concatenation is compared with
         the CER of the two lines read alone (same references).  A large gap = the model does not generalise to longer lines."""

@@ -20,8 +20,8 @@ How it runs:
     runs train side by side.  The LLM shares the GPU of the run that needs it.
   * every run resumes from its own last checkpoint; the ledger (`_plan/state.json`) records done / interrupted / failed runs; re-running the plan
     continues where it stopped (on Kaggle: attach the previous version's output and set `resume_from`).
-  * a session deadline: no run starts unless training time remains after the evaluation reserve; a running training stops at the end of the
-    last epoch that fits (resumable); evaluation is never started without its reserve.
+  * a session deadline: no run starts unless training time remains after the evaluation reserve; a running training stops at the step where
+    the deadline falls, with a step checkpoint (resumed exactly, mid-epoch included); evaluation is never started without its reserve.
   * after a run: checkpoints are pruned (best.pt kept only for the core variants at the main label budget), and when a corpus is no longer
     needed by any pending run its downloads and line caches are deleted (disk).
 """
@@ -42,7 +42,7 @@ import traceback
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from .config import Config, DatasetSpec
+from .config import Config
 from .datasets_registry import DATASETS
 from .schedule import budget, complexity_factor
 from .utils import json_safe
@@ -343,7 +343,7 @@ class PlanRunner:
             cfg.train.deadline_unix = stop_at
             payload = {"config": cfg.to_dict()}
         else:
-            payload = {"plan": dataclasses.asdict(plan), "run": r}
+            payload = {"plan": dataclasses.asdict(plan), "run": r, "deadline_unix": stop_at}
         with open(spec_path, "w") as f:
             json.dump(json_safe(payload), f, indent=1)
         if os.path.exists(res_path):
@@ -358,16 +358,20 @@ class PlanRunner:
             lf.flush()
             p = subprocess.Popen([sys.executable, "-m", "inklingua.experiments", r["kind"], spec_path, res_path], stdout=lf, stderr=subprocess.STDOUT,
                                  env=env, cwd=plan.work_dir)
+            stopped_by_plan = False
             try:
                 p.wait(timeout=max(60.0, self.deadline + 15 * 60 - time.time()))
             except subprocess.TimeoutExpired:
+                stopped_by_plan = True                        # SIGTERM: a training writes a step checkpoint and exits
                 p.terminate()
                 try:
-                    p.wait(timeout=120)
+                    p.wait(timeout=180)
                 except subprocess.TimeoutExpired:
                     p.kill()
         wall = time.time() - t
         res = {"status": "failed", "error": f"no result file (exit code {p.returncode})"}
+        if stopped_by_plan and not os.path.exists(res_path):
+            res = {"status": "interrupted"}                    # the session ended: not a failure, no attempt is counted
         if os.path.exists(res_path):
             with open(res_path) as f:
                 res = json.load(f)
@@ -663,8 +667,12 @@ def _cmd_adapt(spec_path: str, res_path: str) -> None:
         cfg.llm.backend, cfg.llm.model_name, cfg.llm.source_language = "causal", plan.llm_name, info["language"]
         with open(os.path.join(out_dir, "adaptation_setup.json"), "w") as f:
             json.dump(json_safe(info), f, indent=1, ensure_ascii=False)
-        run_adapt_curve(cfg)
-        res = {"status": "done"} if os.path.exists(os.path.join(out_dir, "adapt_curve.json")) else {"status": "failed", "error": "no adapt_curve.json"}
+        cfg.train.deadline_unix = float(payload.get("deadline_unix") or 0.0)
+        out = run_adapt_curve(cfg)
+        if isinstance(out, dict) and out.get("interrupted"):
+            res = {"status": "interrupted"}
+        else:
+            res = {"status": "done"} if os.path.exists(os.path.join(out_dir, "adapt_curve.json")) else {"status": "failed", "error": "no adapt_curve.json"}
     except Exception:
         res = {"status": "failed", "error": traceback.format_exc()}
     with open(res_path, "w") as f:

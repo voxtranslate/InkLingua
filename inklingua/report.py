@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional, Sequence
 import numpy as np
 
 from .style import STYLE_NAMES
-from .text import bootstrap_cer_ci, edit_distance
+from .text import bootstrap_cer_ci
 from .utils import LOG, json_safe
 
 _REPORT_REFS = [{"label": "HTR-VT, all 6,482 labeled IAM-line training lines, no external data (arXiv 2409.08573; Pattern Recognition 2025)", "cer": 0.047,

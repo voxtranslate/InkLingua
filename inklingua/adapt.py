@@ -15,8 +15,10 @@ import copy
 import csv
 import json
 import os
+import random
 import time
 import unicodedata
+from functools import partial
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import matplotlib
@@ -29,7 +31,7 @@ from torch.utils.data import DataLoader, Dataset
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
-from .alphabet import CharGroups, extend_codec, extend_ctc_heads, resolve_variants
+from .alphabet import extend_codec, extend_ctc_heads, resolve_variants
 from .config import Config, ModelConfig, dc_from_dict
 from .data import BucketBatchSampler, HandwritingDataModule, preprocess_line, to_u8
 from .decoding import greedy_decode, seq_confidence
@@ -225,7 +227,9 @@ class ZeroShotAdapter:
 
     def _loader(self, idxs: Sequence[int], bs: int, shuffle: bool = False, epoch: int = 0) -> DataLoader:
         s = BucketBatchSampler(self.ds.width, bs, shuffle, 50, seed=self.cfg.run.seed + epoch, indices=list(idxs))
-        return DataLoader(self.ds, batch_sampler=s, collate_fn=lambda it: collate_lines(it, self.codec), num_workers=0)
+        g = torch.Generator()
+        g.manual_seed(int(self.cfg.run.seed) * 7919 + int(epoch))                     # never draws from the global RNG (exact resume)
+        return DataLoader(self.ds, batch_sampler=s, collate_fn=partial(collate_lines, codec=self.codec), num_workers=0, generator=g)
 
     @torch.no_grad()
     def read(self, model: nn.Module, idxs: Sequence[int]) -> Dict[str, Any]:
@@ -350,7 +354,7 @@ class ZeroShotAdapter:
         if not idx:
             return {"n_train": 0, "loss": float("nan")}
         _set_adapt_mode(student)
-        tot, cnt = 0.0, 0
+        tot, cnt = torch.zeros((), device=self.device), 0
         for ep in range(ac.epochs_per_round):
             for batch in self._loader(idx, ac.batch_size, True, rnd * 100 + ep):
                 x, wd = batch["image"].to(self.device), batch["width"].to(self.device)
@@ -375,9 +379,9 @@ class ZeroShotAdapter:
                 opt.step()
                 self.step += 1
                 ema.update(student, self.step)
-                tot, cnt = tot + float(loss), cnt + 1
+                tot, cnt = tot + loss.detach(), cnt + 1
         student.eval()
-        return {"n_train": len(idx), "loss": tot / max(cnt, 1)}
+        return {"n_train": len(idx), "loss": float(tot) / max(cnt, 1)}
 
     def _optimizer(self, student: nn.Module):
         for p in student.parameters():
@@ -407,9 +411,18 @@ class ZeroShotAdapter:
         self.aug = GPUAugment(cfg.train, np.zeros(NUM_DESC, np.float32), np.ones(NUM_DESC, np.float32))
         opt = self._optimizer(student)
         self.step = 0
-        metrics: Dict[str, Any] = {"zero_shot_start": self.measure(ema.module, "round 0 (before any training)")}
+        state_path = os.path.join(out_dir, "adapt_state.pt")
+        first = self._load_round_state(state_path, student, ema, opt)
+        if first == 0:
+            metrics: Dict[str, Any] = {"zero_shot_start": self.measure(ema.module, "round 0 (before any training)")}
+        else:
+            metrics = self._resumed_metrics
         all_idx = list(range(len(self.ds)))
-        for rnd in range(ac.rounds):
+        for rnd in range(first, ac.rounds):
+            if cfg.train.deadline_unix > 0 and time.time() > cfg.train.deadline_unix - 120:
+                LOG.warning("[ZERO-SHOT] deadline: stopping before round %d (adapt_state.pt holds round %d; the next start continues)", rnd + 1, rnd)
+                metrics["interrupted"] = True
+                return metrics
             t0 = time.time()
             read_idx = [i for i in all_idx if i not in self.eval_ref]
             R = self.read(ema.module, read_idx)
@@ -426,6 +439,7 @@ class ZeroShotAdapter:
             rec = {"round": rnd + 1, "seconds": round(time.time() - t0, 1), **{k: (round(v, 4) if isinstance(v, float) else v) for k, v in info.items()}, **tr,
                    "eval": self.measure(ema.module, f"after round {rnd + 1}")}
             self.log["rounds"].append(rec)
+            self._save_round_state(state_path, rnd + 1, student, ema, opt, metrics)
             LOG.info("[ZERO-SHOT] round %d/%d | %s | threshold covers %.1f %% of the target lines | factor %.2f (%d anchors) | selected %d lines | domain AUROC %.2f | "
                      "train loss %.3f", rnd + 1, ac.rounds, info.get("mode"), 100 * info.get("coverage_target", 0.0), info.get("factor", float("nan")),
                      info.get("n_anchors", 0), info.get("selected", 0), info.get("domain_auroc", float("nan")), tr.get("loss", float("nan")))
@@ -433,6 +447,37 @@ class ZeroShotAdapter:
         metrics["zero_shot_end"] = self.measure(ema.module, "final")
         self._finish(ema.module, out_dir, metrics)
         return metrics
+
+    def _compat(self) -> Dict[str, Any]:
+        return json_safe({"checkpoint": self.ckpt_path, "units": self.codec.units, "n_lines": len(self.ds), "anchors": sorted(self.anchor_ref),
+                          "seed": self.cfg.run.seed, "rounds": self.ac.rounds, "epochs_per_round": self.ac.epochs_per_round})
+
+    def _save_round_state(self, path: str, done: int, student: nn.Module, ema: ModelEMA, opt, metrics: Dict[str, Any]) -> None:
+        """After every round: everything needed to continue with the next round after an interruption."""
+        rng = {"torch": torch.get_rng_state(), "numpy": np.random.get_state(), "py": random.getstate()}
+        if torch.cuda.is_available():
+            rng["cuda"] = torch.cuda.get_rng_state_all()
+        atomic_save({"rounds_done": done, "student": student.state_dict(), "ema": ema.module.state_dict(), "opt": opt.state_dict(), "step": self.step,
+                     "log": self.log, "tied": sorted(self.tied), "metrics": metrics, "rng": rng, "compat": self._compat()}, path)
+
+    def _load_round_state(self, path: str, student: nn.Module, ema: ModelEMA, opt) -> int:
+        if not os.path.exists(path):
+            return 0
+        st = torch_load(path)
+        if st.get("compat") != self._compat():
+            LOG.warning("[ZERO-SHOT] %s belongs to another setup: starting the adaptation from round 1", path)
+            return 0
+        student.load_state_dict(st["student"])
+        ema.module.load_state_dict(st["ema"])
+        opt.load_state_dict(st["opt"])
+        self.step, self.log, self.tied, self._resumed_metrics = int(st["step"]), st["log"], set(st["tied"]), st["metrics"]
+        torch.set_rng_state(st["rng"]["torch"].cpu())
+        np.random.set_state(st["rng"]["numpy"])
+        random.setstate(st["rng"]["py"])
+        if "cuda" in st["rng"] and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(st["rng"]["cuda"])
+        LOG.info("[ZERO-SHOT] RESUMED after round %d of %d (%s)", st["rounds_done"], self.ac.rounds, path)
+        return int(st["rounds_done"])
 
     def _finish(self, model: nn.Module, out_dir: str, metrics: Dict[str, Any]) -> None:
         ac, cfg = self.ac, self.cfg
@@ -495,8 +540,16 @@ def run_adapt_curve(cfg: Optional[Config] = None) -> Dict[str, Any]:
         c = copy.deepcopy(cfg)
         c.adapt.anchor_limit = int(k)
         c.adapt.out_dir = os.path.join(cfg.adapt.out_dir or os.path.join(cfg.run_dir, "adapt"), f"anchors_{k}")
-        set_seed(cfg.run.seed)
-        m = ZeroShotAdapter(c, device, llm).run()
+        done = os.path.join(c.adapt.out_dir, "adapt_metrics.json")
+        if os.path.exists(done):                      # finished in an earlier session: read, do not recompute
+            with open(done) as f:
+                m = json.load(f)
+            LOG.info("[ZERO-SHOT] %d anchors: already finished (%s)", k, done)
+        else:
+            set_seed(cfg.run.seed)
+            m = ZeroShotAdapter(c, device, llm).run()
+            if m.get("interrupted"):
+                return {"interrupted": True}
         curve[int(k)] = {"start": m.get("zero_shot_start"), "end": m.get("zero_shot_end"), "last_round": (m.get("rounds") or [{}])[-1].get("selected")}
     base = cfg.adapt.out_dir or os.path.join(cfg.run_dir, "adapt")
     with open(os.path.join(base, "adapt_curve.json"), "w") as f:

@@ -156,12 +156,36 @@ def atomic_save(obj: Any, path: str) -> None:
     os.replace(tmp, path)
 
 
-def torch_load(path: str, map_location="cpu") -> Any:
-    """Our own checkpoints contain numpy arrays / lists -> weights_only=False is intended."""
+def _numpy_safe_globals() -> list:
+    """The numpy objects our checkpoints contain (random states, small arrays): allowlisted for torch.load(weights_only=True)."""
+    import importlib
+    g: list = [np.ndarray, np.dtype]
+    for mod in ("numpy._core.multiarray", "numpy.core.multiarray"):
+        try:
+            m = importlib.import_module(mod)
+            g += [m._reconstruct, m.scalar]
+        except Exception:
+            pass
+    try:                                                        # numpy >= 1.25: one class per dtype (numpy.dtypes.Int8DType, ...)
+        import numpy.dtypes as npd
+        g += [getattr(npd, n) for n in dir(npd) if n.endswith("DType") and isinstance(getattr(npd, n), type)]
+    except Exception:
+        pass
+    return g
+
+
+def torch_load(path: str, map_location="cpu", trusted: bool = False) -> Any:
+    """torch.load with weights_only=True (no arbitrary code from a pickle) and the numpy types of our checkpoints allowlisted.  Unrestricted
+    unpickling is used only when the caller says the file is trusted (or INKLINGUA_TRUSTED_CHECKPOINTS=1), e.g. a checkpoint of an older version."""
     try:
+        with torch.serialization.safe_globals(_numpy_safe_globals()):
+            return torch.load(path, map_location=map_location, weights_only=True)
+    except Exception as e:
+        if not (trusted or os.environ.get("INKLINGUA_TRUSTED_CHECKPOINTS") == "1"):
+            raise RuntimeError(f"{path} cannot be loaded safely (weights_only=True): {str(e).splitlines()[0][:200]}.  If you trust this file, "
+                               "set INKLINGUA_TRUSTED_CHECKPOINTS=1.") from e
+        LOG.warning("loading %s with weights_only=False (trusted file)", path)
         return torch.load(path, map_location=map_location, weights_only=False)
-    except TypeError:  # very old torch
-        return torch.load(path, map_location=map_location)
 
 
 def to_device(batch: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
@@ -186,3 +210,14 @@ class Meter:
 
     def means(self) -> Dict[str, float]:
         return {k: self.mean(k) for k in self.sum}
+
+    def state(self) -> Dict[str, Dict[str, float]]:
+        return {"sum": dict(self.sum), "cnt": dict(self.cnt)}
+
+    @classmethod
+    def from_state(cls, st: Optional[Dict[str, Dict[str, float]]]) -> "Meter":
+        m = cls()
+        if st:
+            m.sum.update(st["sum"])
+            m.cnt.update(st["cnt"])
+        return m

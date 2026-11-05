@@ -76,7 +76,19 @@ new language), `report` (rebuild the report of an existing run), `smoke`.
 | `inklingua/experiments.py` | the article's experiment plan: corpus after corpus, GPU workers, resumable ledger, session deadline |
 | `inklingua/schedule.py` | the training-budget rule (epochs from corpus size, script and era; IAM = the v10 defaults) |
 | `inklingua/paper.py` | paper tables (md / tex / csv), figures, pooled paired bootstrap, Holm, sign test, reproducibility report |
-| `inklingua/selftest.py` | 18 fast invariant tests + the synthetic smoke (repository tests only; the notebook runs neither) |
+| `inklingua/selftest.py` | 19 fast invariant tests (incl. exact mid-epoch resume) + the synthetic smoke (repository tests only; real runs and the notebook run neither) |
+
+## Data, caching and resuming
+
+* **Download once.**  Every corpus is read from a pinned Hub commit; once its parquet files are on disk they are found without any
+  network request.  Set `HF_TOKEN` (or, on Kaggle, a secret named `HF_TOKEN`) for higher rate limits; public corpora work without it.
+* **Preprocess once.**  Lines are decoded in parallel processes into a line cache (`<work_dir>/cache/lines`, on by default) that also
+  stores split sizes and transcriptions: a later run of the same corpus needs neither the download nor the decoding.  Images that are
+  mostly blank page (KHATT) are cut to their text band first (`data.ink_band`; tight line crops such as IAM are unchanged).
+* **Resume exactly.**  Every training writes a step checkpoint at least every `cfg.train.ckpt_every_minutes` (10) and whenever it is
+  stopped (SIGTERM, the stop button of a notebook, `cfg.train.deadline_unix`).  Re-running the same configuration continues at that step
+  with the same batches and random state; a self-test checks that the result is bit-identical to an uninterrupted run.  The zero-shot
+  adapter checkpoints every round.
 
 ## The protocol (why the numbers can be trusted)
 
@@ -99,7 +111,7 @@ licences of the underlying corpora are research-only in several cases: check `do
 
 ## Status and honesty
 
-* Verified here: 18 self-tests, a real-IAM run of the experiment plan on CPU, and the synthetic end-to-end smoke (train, resume, inference, report) on CPU.  Facts about the
+* Verified here: 19 self-tests, a real-IAM run of the experiment plan on CPU, the preprocessing of IAM + RIMES + KHATT (cold and offline-warm), and the synthetic end-to-end smoke (train, resume, inference, report) on CPU.  Facts about the
   datasets and the literature were checked online on 2026-11-04 (`docs/AUDIT_v10_to_v11.md`, section C).
 * **Unverified**: the real-IAM benefit of every component, including whether unlabeled data helps at all.  Run the suite.
 * The LLM translation evaluation has no human reference; the LLM's translation of the true text is the proxy.

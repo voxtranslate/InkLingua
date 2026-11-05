@@ -141,12 +141,12 @@ class VectorQuantizerEMA(nn.Module):
         tot = self.cluster_size.sum()
         cs = (self.cluster_size + self.eps) / (tot + self.K * self.eps) * tot
         self.embed.copy_(self.embed_avg / cs.unsqueeze(1))
-        dead = self.cluster_size < self.dead
-        if flat.size(0) > 0 and bool(dead.any()):
-            r = flat[torch.randint(0, flat.size(0), (int(dead.sum()),), device=flat.device)]
-            self.embed[dead] = r
-            self.embed_avg[dead] = r
-            self.cluster_size[dead] = self.dead * 2
+        if flat.size(0) > 0:                                # dead codes restart on random current vectors (branch-free: no host sync per step)
+            dead = (self.cluster_size < self.dead).unsqueeze(1)
+            r = flat[torch.randint(0, flat.size(0), (self.K,), device=flat.device)]
+            self.embed.copy_(torch.where(dead, r, self.embed))
+            self.embed_avg.copy_(torch.where(dead, r, self.embed_avg))
+            self.cluster_size.copy_(torch.where(dead.squeeze(1), torch.full_like(self.cluster_size, self.dead * 2), self.cluster_size))
 
     def forward(self, z: torch.Tensor, valid: torch.Tensor):
         with torch.autocast(device_type=z.device.type, enabled=False):
@@ -447,40 +447,58 @@ class ClosedFormLeakage:
         self.Y = torch.zeros(self.size, n_desc, device=device)
         self.M = torch.zeros(self.size, n_desc, device=device)
         self.n, self.ptr = 0, 0
-        self.last: Dict[str, float] = {}
+        self.last_vals: Optional[torch.Tensor] = None
 
     @torch.no_grad()
     def _push(self, c: torch.Tensor, y: torch.Tensor, m: torch.Tensor) -> None:
-        for k in range(c.size(0)):
-            self.C[self.ptr], self.Y[self.ptr], self.M[self.ptr] = c[k], y[k], m[k]
-            self.ptr = (self.ptr + 1) % self.size
-            self.n = min(self.n + 1, self.size)
+        """Ring-buffer write of a whole batch at once (one indexed copy per tensor, no per-sample kernel launches)."""
+        b = min(c.size(0), self.size)
+        c, y, m = c[-b:], y[-b:], m[-b:]
+        idx = (self.ptr + torch.arange(b, device=self.C.device)) % self.size
+        self.C[idx], self.Y[idx], self.M[idx] = c, y, m
+        self.ptr = (self.ptr + b) % self.size
+        self.n = min(self.n + b, self.size)
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {"C": self.C, "Y": self.Y, "M": self.M, "n": self.n, "ptr": self.ptr}
+
+    def load_state_dict(self, st: Dict[str, Any]) -> None:
+        for k in ("C", "Y", "M"):
+            getattr(self, k).copy_(st[k].to(getattr(self, k).device))
+        self.n, self.ptr = int(st["n"]), int(st["ptr"])
+
+    @property
+    def last(self) -> Dict[str, float]:
+        """Explained variance of each active descriptor at the last step (one host transfer, only when asked for)."""
+        if self.last_vals is None:
+            return {}
+        return {"leak_r2_" + str(j): v for j, v in zip(self.active, self.last_vals.tolist())}
 
     def __call__(self, c: torch.Tensor, y: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
         c, y, m = c.float(), y.detach().float(), m.detach().float()
         zero = c.new_zeros(())
+        self.last_vals = None
         if not self.active or self.n < max(64, self.size // 4):
             self._push(c.detach(), y, m)
             return zero
-        with torch.no_grad():
+        act = torch.as_tensor(self.active, device=c.device)
+        with torch.no_grad():                               # one batched ridge solve for all active descriptors, no host sync
             Cq, Yq, Mq = self.C[:self.n], self.Y[:self.n], self.M[:self.n]
             mu, sd = Cq.mean(0), Cq.std(0) + 1e-4
-            A = (Cq - mu) / sd
-            W = torch.zeros(A.size(1), Yq.size(1), device=c.device)
+            A = (Cq - mu) / sd                                              # n x D
+            Ma = Mq[:, act].t()                                             # J x n   (measured masks)
+            nj = Ma.sum(1)                                                  # J
+            Am = A.unsqueeze(0) * Ma.unsqueeze(-1)                          # J x n x D
             eye = torch.eye(A.size(1), device=c.device)
-            for j in self.active:
-                mj = Mq[:, j]
-                nj = mj.sum()
-                if float(nj) < 32:
-                    continue
-                Aj = A * mj[:, None]
-                W[:, j] = torch.linalg.solve(Aj.t() @ A / nj + self.ridge * eye, Aj.t() @ Yq[:, j] / nj)
+            G = Am.transpose(1, 2) @ A / nj.clamp(min=1.0)[:, None, None] + self.ridge * eye
+            rhs = (Am.transpose(1, 2) @ Yq[:, act].t().unsqueeze(-1)).squeeze(-1) / nj.clamp(min=1.0)[:, None]
+            Wj = torch.linalg.solve(G, rhs) * (nj >= 32).to(A.dtype)[:, None]   # descriptors measured on < 32 queued lines: no penalty
+            W = torch.zeros(A.size(1), Yq.size(1), device=c.device)
+            W[:, act] = Wj.t()
         pred = ((c - mu) / sd) @ W
         leak = (pred ** 2 * m).sum(0) / m.sum(0).clamp(min=1.0)
-        act = torch.zeros_like(leak, dtype=torch.bool)
-        act[self.active] = True
-        pen = torch.relu(leak - self.floor - self.slack)[act].mean()
-        self.last = {"leak_r2_" + str(j): float(leak[j].detach()) for j in self.active}
+        pen = torch.relu(leak[act] - self.floor[act] - self.slack).mean()
+        self.last_vals = leak[act].detach()
         self._push(c.detach(), y, m)
         return pen
 

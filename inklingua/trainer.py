@@ -9,6 +9,8 @@ import json
 import math
 import os
 import random
+import signal
+import threading
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -102,10 +104,7 @@ class Trainer:
         if self.use_amp:   # bf16 only where it is native (compute capability >= 8); fp16 + GradScaler elsewhere
             self.amp_dtype = torch.bfloat16 if torch.cuda.get_device_capability(device)[0] >= 8 else torch.float16
         use_scaler = self.use_amp and self.amp_dtype == torch.float16
-        try:
-            self.scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
-        except Exception:
-            self.scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
+        self.scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
         decay, no_decay = [], []
         for n, p in self.model.named_parameters():
             (decay if p.ndim >= 2 else no_decay).append(p)
@@ -123,6 +122,10 @@ class Trainer:
         self.prev_val_cer: Optional[np.ndarray] = None
         self.skipped = 0
         self.interrupted, self.completed_epochs = False, 0
+        self._resume_partial: Optional[Dict[str, Any]] = None       # set by _try_resume when last.pt was written in the middle of an epoch
+        self._last_ckpt = time.time()
+        self._stop_signal: Optional[int] = None
+        self._phase_secs: Dict[str, List[float]] = {"refresh": [], "eval": []}
         # ---- FRAG-RC state: reliability model + one threshold per cell (re-fitted every `refresh_every` epochs)
         self.frag_state: Optional[Dict[str, Any]] = None
         self.frag_model: Optional[FragModel] = None
@@ -214,71 +217,138 @@ class Trainer:
         reps = int(math.ceil(need / max(len(pool), 1)))
         return np.concatenate([rng.permutation(pool) for _ in range(reps)])[:need]
 
-    def _train_epoch(self, epoch: int) -> Dict[str, float]:
-        self.model.train()
-        loader = self.data.train_loader(self._epoch_pool(epoch))
-        loader.batch_sampler.set_epoch(epoch)
-        meter, dev = Meter(), self.device
-        keys = ("total", "ctc", "aux_ctc", "style_reg", "style_cls", "leak", "cons", "decor", "vq", "mask", "frag")
-        bar = tqdm(loader, desc=f"epoch {epoch + 1}/{self.tc.epochs}", leave=False)
-        teacher = self.ema.module.eval()
-        for batch in bar:
-            batch = to_device(batch, dev)
-            lr = self._lr(self.global_step)
-            for g in self.opt.param_groups:
-                g["lr"] = lr
-            x_s, x_w, wd, st_t, st_m, cl_ok = self.aug(batch["image"], batch["style"], batch["style_ok"], batch["width"], batch["min_width"])
-            aux, vql = self._aux_scale(self.global_step), self._vq_lambda(self.global_step)
-            t_lp, t_out, frag = None, None, None
-            use_frag = self.fc.enabled and self.frag_model is not None and self.tc.loss.frag > 0
-            if (self.tc.loss.consistency > 0 or use_frag) and aux > 0:
-                with torch.no_grad(), torch.autocast(device_type=dev.type, dtype=self.amp_dtype, enabled=self.use_amp):
-                    t_out = teacher(x_w, wd)
-                t_lp = t_out["log_probs"].float()
-            if use_frag and t_out is not None:
-                frag = self._frag_batch(t_out, x_s, wd, (~batch["labeled"]) & (batch["weight"] <= 0), batch["stratum"])
-            with torch.autocast(device_type=dev.type, dtype=self.amp_dtype, enabled=self.use_amp):
-                out = self.model(x_s, wd, vq_lambda=vql, mask_prob=self.cfg.model.mask_prob * aux)
-            L = compute_losses(out, batch, self.tc.loss, st_t, st_m, cl_ok, True, aux_scale=aux, vq_scale=vql, teacher_lp=t_lp, leak=self.leak, frag=frag)
-            if not torch.isfinite(L["total"]):
-                self.skipped += 1
-                self.opt.zero_grad(set_to_none=True)
-                continue
-            self.opt.zero_grad(set_to_none=True)
-            self.scaler.scale(L["total"]).backward()
-            self.scaler.unscale_(self.opt)
-            gn = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.tc.grad_clip)
-            self.scaler.step(self.opt)
-            self.scaler.update()
-            self.ema.update(self.model, self.global_step)
-            self.global_step += 1
+    # ------------------------------------------------------------------ stopping and step checkpoints
+    def _deadline_left(self) -> float:
+        return float("inf") if self.tc.deadline_unix <= 0 else self.tc.deadline_unix - time.time()
 
-            B = batch["image"].size(0)
-            vals = torch.stack([L[k].detach().float() for k in keys] + [gn.detach().float(), out["ppl_low"].float(), out["ppl_high"].float()]).cpu().tolist()
-            for k, v in zip(keys, vals[:len(keys)]):
-                meter.add(k, v, B)
-            lc_ = self.tc.loss
-            meter.add("task_total", vals[1] + lc_.style_reg * vals[3] + lc_.style_cls * vals[4], B)
-            meter.add("grad_norm", vals[len(keys)], 1)
-            meter.add("ppl_low", vals[len(keys) + 1], 1)
-            meter.add("ppl_high", vals[len(keys) + 2], 1)
-            for k, v in self.leak.last.items():
-                meter.add(k, v, 1)
-            if frag is not None:
-                meter.add("frag_trust", frag["trusted_frames"] / max(frag["frames"], 1), 1)
-                meter.add("frag_char_trust", frag["n_trusted_chars"] / max(frag["n_chars"], 1), 1)
-            ps, lab = L["_ctc_ps"], batch["labeled"]
-            if bool(lab.any()):
-                meter.add("ctc_labeled", float(ps[lab].mean()), int(lab.sum()))
-            pl = (~lab) & (batch["weight"] > 0)
-            if bool(pl.any()):
-                meter.add("ctc_pseudo", float(ps[pl].mean()), int(pl.sum()))
-                self.bank.update_loss(batch["index"][pl].cpu().tolist(), ps[pl].cpu().tolist())
-            bar.set_postfix(loss=f"{meter.mean('total'):.3f}", ctc=f"{meter.mean('ctc'):.3f}", lr=f"{lr:.1e}")
+    def _phase_fits(self, phase: str) -> bool:
+        """Whether a phase of typical duration (refresh / end-of-epoch evaluation, measured on this run) still fits before the deadline."""
+        past = self._phase_secs[phase]
+        return self._deadline_left() > 1.2 * (float(np.median(past)) if past else 0.0) + 60.0
+
+    def _must_stop(self) -> bool:
+        return self._stop_signal is not None or self._deadline_left() < 90.0
+
+    def save_step_checkpoint(self, epoch: int, step: int, batches: List[List[int]], meter: Meter, rec: Dict[str, float]) -> None:
+        """last.pt in the middle of epoch `epoch` (0-based) after `step` of its batches: everything the step loop needs to continue exactly where
+        it stopped (the epoch's batch list, the running means, the refresh metrics of the epoch, every random state)."""
+        st = self._state(epoch)
+        st["partial"] = {"epoch": int(epoch), "step": int(step), "batches": batches, "meter": meter.state(), "rec": dict(rec)}
+        atomic_save(st, os.path.join(self.cfg.ckpt_dir, "last.pt"))
+        self._last_ckpt = time.time()
+
+    def _install_signal_handlers(self):
+        """SIGTERM (a scheduler / the experiment plan stopping the run) -> finish the current step, write a step checkpoint, stop."""
+        if threading.current_thread() is not threading.main_thread():
+            return None
+
+        def handler(signum, _frame):
+            self._stop_signal = int(signum)
+        try:
+            return signal.signal(signal.SIGTERM, handler)
+        except (ValueError, OSError):
+            return None
+
+    def _train_epoch(self, epoch: int, rec: Optional[Dict[str, float]] = None, resume: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, float]]:
+        """One epoch of optimisation steps.  Returns the running means, or None when the run had to stop in the middle (deadline, SIGTERM,
+        KeyboardInterrupt): a step checkpoint has then been written and the next start continues with the next batch."""
+        self.model.train()
+        rec = dict(rec or {})
+        if resume is not None:
+            batches, start, meter = resume["batches"], int(resume["step"]), Meter.from_state(resume["meter"])
+            LOG.info("continuing epoch %d at step %d of %d", epoch + 1, start, len(batches))
+        else:
+            batches, start, meter = self.data.epoch_batches(self._epoch_pool(epoch), epoch), 0, Meter()
+        loader = self.data.train_loader(batches=batches[start:])
+        self.device
+        keys = ("total", "ctc", "aux_ctc", "style_reg", "style_cls", "leak", "cons", "decor", "vq", "mask", "frag")
+        bar = tqdm(loader, desc=f"epoch {epoch + 1}/{self.tc.epochs}", leave=False, initial=start, total=len(batches))
+        step = start
+        try:
+            for batch in bar:
+                self._train_step(batch, keys, meter)
+                step += 1
+                if self._must_stop():
+                    self.save_step_checkpoint(epoch, step, batches, meter, rec)
+                    why = f"signal {self._stop_signal}" if self._stop_signal is not None else "the deadline"
+                    LOG.warning("[STOP] %s: step checkpoint at epoch %d, step %d/%d -- the next start continues from there", why, epoch + 1, step, len(batches))
+                    self.interrupted = True
+                    return None
+                if time.time() - self._last_ckpt >= 60.0 * self.tc.ckpt_every_minutes:
+                    self.save_step_checkpoint(epoch, step, batches, meter, rec)
+                bar.set_postfix(loss=f"{meter.mean('total'):.3f}", ctc=f"{meter.mean('ctc'):.3f}", refresh=False)
+        except KeyboardInterrupt:
+            self.save_step_checkpoint(epoch, step, batches, meter, rec)
+            LOG.warning("[STOP] interrupted by the user: step checkpoint at epoch %d, step %d/%d", epoch + 1, step, len(batches))
+            raise
+        self._epoch_batches, self._epoch_meter = batches, meter
         return meter.means()
 
+    def _train_step(self, batch: Dict[str, Any], keys: Tuple[str, ...], meter: Meter) -> None:
+        """One optimisation step.  Two host synchronisations per step: the finiteness test of the loss and ONE transfer of every logged value."""
+        dev, tc = self.device, self.tc
+        teacher = self.ema.module.eval()
+        batch = to_device(batch, dev)
+        lr = self._lr(self.global_step)
+        for g in self.opt.param_groups:
+            g["lr"] = lr
+        x_s, x_w, wd, st_t, st_m, cl_ok = self.aug(batch["image"], batch["style"], batch["style_ok"], batch["width"], batch["min_width"])
+        aux, vql = self._aux_scale(self.global_step), self._vq_lambda(self.global_step)
+        t_lp, t_out, frag = None, None, None
+        use_frag = self.fc.enabled and self.frag_model is not None and tc.loss.frag > 0
+        if (tc.loss.consistency > 0 or use_frag) and aux > 0:
+            with torch.no_grad(), torch.autocast(device_type=dev.type, dtype=self.amp_dtype, enabled=self.use_amp):
+                t_out = teacher(x_w, wd)                     # no_grad, not inference_mode: these tensors enter the student's loss
+            t_lp = t_out["log_probs"].float()
+        if use_frag and t_out is not None:
+            frag = self._frag_batch(t_out, x_s, wd, (~batch["labeled"]) & (batch["weight"] <= 0), batch["stratum"])
+        with torch.autocast(device_type=dev.type, dtype=self.amp_dtype, enabled=self.use_amp):
+            out = self.model(x_s, wd, vq_lambda=vql, mask_prob=self.cfg.model.mask_prob * aux)
+        L = compute_losses(out, batch, tc.loss, st_t, st_m, cl_ok, True, aux_scale=aux, vq_scale=vql, teacher_lp=t_lp, leak=self.leak, frag=frag)
+        self.opt.zero_grad(set_to_none=True)
+        if not torch.isfinite(L["total"]):
+            self.skipped += 1
+            return
+        self.scaler.scale(L["total"]).backward()
+        self.scaler.unscale_(self.opt)
+        gn = torch.nn.utils.clip_grad_norm_(self.model.parameters(), tc.grad_clip)
+        self.scaler.step(self.opt)
+        self.scaler.update()
+        self.ema.update(self.model, self.global_step)
+        self.global_step += 1
+
+        B = batch["image"].size(0)
+        ps, lab = L["_ctc_ps"].detach().float(), batch["labeled"]
+        pl = (~lab) & (batch["weight"] > 0)
+        leak = self.leak.last_vals if self.leak.last_vals is not None else ps.new_zeros(0)
+        head = torch.stack([L[k].detach().float() for k in keys] + [gn.detach().float(), out["ppl_low"].detach().float(), out["ppl_high"].detach().float(),
+                            (ps * lab).sum(), lab.sum().float(), (ps * pl).sum(), pl.sum().float()])
+        v = torch.cat([head, leak.float(), ps, pl.float()]).cpu().numpy()          # the one host transfer of the step
+        nk = len(keys)
+        for k, x in zip(keys, v[:nk]):
+            meter.add(k, float(x), B)
+        lc_ = tc.loss
+        meter.add("task_total", float(v[1] + lc_.style_reg * v[3] + lc_.style_cls * v[4]), B)
+        meter.add("grad_norm", float(v[nk]), 1)
+        meter.add("ppl_low", float(v[nk + 1]), 1)
+        meter.add("ppl_high", float(v[nk + 2]), 1)
+        s_lab, n_lab, s_pl, n_pl = (float(x) for x in v[nk + 3:nk + 7])
+        o = nk + 7
+        for j, x in zip(self.leak.active if len(leak) else [], v[o:o + len(leak)]):
+            meter.add(f"leak_r2_{j}", float(x), 1)
+        o += len(leak)
+        ps_h, pl_h = v[o:o + B], v[o + B:o + 2 * B] > 0.5
+        if frag is not None:
+            meter.add("frag_trust", frag["trusted_frames"] / max(frag["frames"], 1), 1)
+            meter.add("frag_char_trust", frag["n_trusted_chars"] / max(frag["n_chars"], 1), 1)
+        if n_lab > 0:
+            meter.add("ctc_labeled", s_lab / n_lab, int(n_lab))
+        if n_pl > 0:
+            meter.add("ctc_pseudo", s_pl / n_pl, int(n_pl))
+            self.bank.update_loss(batch["index"][torch.from_numpy(pl_h).to(batch["index"].device)].cpu().tolist(), ps_h[pl_h].tolist())
+
     # ------------------------------------------------------------------ evaluation
-    @torch.no_grad()
+    @torch.inference_mode()
     def evaluate(self, model: nn.Module, ds: HandwritingDataset, indices: Optional[Sequence[int]] = None, noise: bool = False) -> Dict[str, Any]:
         model.eval()
         loader = self.data.eval_loader(ds, indices)
@@ -321,7 +391,7 @@ class Trainer:
         return res
 
     # ------------------------------------------------------------------ legacy pseudo-labelling (line level)
-    @torch.no_grad()
+    @torch.inference_mode()
     def _teacher_read(self, idxs: np.ndarray, keep_lp: bool = False, desc: str = "teacher") -> Dict[str, Any]:
         """The EMA teacher reads the given train lines (clean view + the perturbed views) and describes every reading with the label-free
         reliability features."""
@@ -480,7 +550,7 @@ class Trainer:
         with torch.no_grad(), torch.autocast(device_type=dev.type, dtype=self.amp_dtype, enabled=self.use_amp):
             return teacher(x_w, wd), teacher(x_s, wd)
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def _frag_collect(self, idxs: np.ndarray, ref_fn, passes: int, seed: int) -> Dict[str, np.ndarray]:
         """Evidence (+ correctness against `ref_fn(line)`) of every emitted character of the given train lines, as the training loop will see
         them: teacher on a weak and a strong augmentation of the same pixels."""
@@ -599,12 +669,14 @@ class Trainer:
                 "best_from": self.best_from, "best_epoch": self.best_epoch, "ref_cer": self.ref_cer, "since_best": self.since_best,
                 "stopped_at": self.stopped_at, "cycles": self.cycles, "frag_state": self.frag_state, "stratum_w": np.asarray(self.stratum_w),
                 "bank": self.bank.state_dict(), "prev_cov": self.prev_cov, "cov_hist": list(self.cov_hist), "prev_val_preds": self.prev_val_preds,
-                "prev_val_cer": self.prev_val_cer, "cfg": self.cfg.to_dict(), "compat": self._compat(), "rng": rng, **self._data_meta()}
+                "prev_val_cer": self.prev_val_cer, "cfg": self.cfg.to_dict(), "compat": self._compat(), "rng": rng, "leak": self.leak.state_dict(),
+                "skipped": self.skipped, "phase_secs": self._phase_secs, **self._data_meta()}
 
     def save_checkpoint(self, completed_epochs: int) -> None:
         d = self.cfg.ckpt_dir
         st = self._state(completed_epochs)
         atomic_save(st, os.path.join(d, "last.pt"))
+        self._last_ckpt = time.time()
         if completed_epochs % self.tc.save_every == 0:
             atomic_save(st, os.path.join(d, f"epoch_{completed_epochs:03d}.pt"))
             old = sorted(glob.glob(os.path.join(d, "epoch_*.pt")))
@@ -665,6 +737,11 @@ class Trainer:
                     torch.cuda.set_rng_state_all(st["rng"]["cuda"])
                 except Exception:
                     pass
+            if st.get("leak") is not None:
+                self.leak.load_state_dict(st["leak"])
+            self.skipped = int(st.get("skipped", 0))
+            self._phase_secs = st.get("phase_secs") or self._phase_secs
+            self._resume_partial = st.get("partial")
             if st.get("cycles"):
                 self.cycles = st["cycles"]
             old_total = int(self.cycles[-1]["end"])
@@ -672,7 +749,9 @@ class Trainer:
                 self._extend_schedule(old_total)
                 if self.stopped_at is not None:
                     self.stopped_at, self.since_best = None, 0
-            LOG.info("RESUMED from %s (completed epochs: %d, global step %d, best val_sel CER %.4f at epoch %d, lr now %.2e)", p, st["epoch"],
+            part = self._resume_partial
+            LOG.info("RESUMED from %s (completed epochs: %d%s, global step %d, best val_sel CER %.4f at epoch %d, lr now %.2e)", p, st["epoch"],
+                     f" + {part['step']}/{len(part['batches'])} steps of epoch {part['epoch'] + 1}" if part else "",
                      self.global_step, self.best_cer, self.best_epoch, self._lr(self.global_step))
             return int(st["epoch"])
         return 0
@@ -695,7 +774,7 @@ class Trainer:
         return float(np.nansum(e["ed_ps"][ix]) / max(np.nansum(e["ref_ps"][ix]), 1))
 
     def fit(self) -> None:
-        cfg, tc, pc, data = self.cfg, self.tc, self.pc, self.data
+        cfg, tc, data = self.cfg, self.tc, self.data
         self.start_epoch = self._try_resume()
         if self.stopped_at is not None:
             LOG.info("Training had stopped early at epoch %d (no val_sel-CER gain for %d epochs); raise cfg.train.epochs to continue.", self.stopped_at, tc.patience)
@@ -709,21 +788,56 @@ class Trainer:
         n_unl = len(data.unlabeled_idx)
         nan = float("nan")
         self.completed_epochs = self.start_epoch
-        epoch_secs: List[float] = []
+        old_handler = self._install_signal_handlers()
+        try:
+            self._fit_epochs(n_unl, nan)
+        finally:
+            if old_handler is not None:
+                signal.signal(signal.SIGTERM, old_handler)
+        if not self.interrupted:
+            LOG.info("Training done. Best val_sel CER %.4f (%s, epoch %d). Curves: %s", self.best_cer, self.best_from, self.best_epoch, cfg.curve_dir)
+            self._final_source_calibration()
+
+    def _stop_between_phases(self, epoch: int, step: int, batches: Optional[List[List[int]]], meter: Optional[Meter], rec: Dict[str, float],
+                             phase: str) -> bool:
+        """Before a long phase (refresh, end-of-epoch evaluation): stop now with a step checkpoint if it would not finish before the deadline."""
+        if self._stop_signal is None and self._phase_fits(phase):
+            return False
+        if batches is None:
+            self.save_checkpoint(epoch)                       # nothing of this epoch done yet: the epoch-boundary checkpoint is the resume point
+        else:
+            self.save_step_checkpoint(epoch, step, batches, meter, rec)
+        LOG.warning("[STOP] the %s of epoch %d would not finish before the deadline: checkpoint written, the next start continues there", phase, epoch + 1)
+        self.interrupted = True
+        return True
+
+    def _fit_epochs(self, n_unl: int, nan: float) -> None:
+        cfg, tc, pc, data = self.cfg, self.tc, self.pc, self.data
         for epoch in range(self.start_epoch, tc.epochs):
-            if tc.deadline_unix > 0:
-                need = (np.median(epoch_secs) if epoch_secs else 0.0) * 1.15
-                if time.time() + need > tc.deadline_unix:
-                    self.interrupted = True
-                    LOG.warning("[DEADLINE] stopping before epoch %d (expected %.0fs, %.0fs left); last.pt holds epoch %d", epoch + 1, need,
-                                tc.deadline_unix - time.time(), epoch)
+            t0 = time.time()
+            part, self._resume_partial = self._resume_partial, None
+            if part is not None and int(part["epoch"]) == epoch:
+                rec = dict(part.get("rec") or {})                # the refresh of this epoch already happened before the stop
+            else:
+                part, rec = None, {}
+                refresh = ((pc.enabled and n_unl > 0 and epoch >= pc.warmup_epochs and (epoch - pc.warmup_epochs) % pc.refresh_every == 0) or
+                           (self.fc.enabled and n_unl > 0 and len(data.calib_idx) and epoch >= self.fc.warmup_epochs
+                            and (epoch - self.fc.warmup_epochs) % self.fc.refresh_every == 0))
+                if refresh and self._stop_between_phases(epoch, 0, None, None, rec, "refresh"):
                     return
-            t0, rec = time.time(), {}
-            if pc.enabled and n_unl > 0 and epoch >= pc.warmup_epochs and (epoch - pc.warmup_epochs) % pc.refresh_every == 0:
-                rec.update(self.refresh_pseudo_labels(epoch))
-            if self.fc.enabled and n_unl > 0 and len(data.calib_idx) and epoch >= self.fc.warmup_epochs and (epoch - self.fc.warmup_epochs) % self.fc.refresh_every == 0:
-                rec.update(self.refresh_frag(epoch))
-            tr = self._train_epoch(epoch)
+                tr0 = time.time()
+                if pc.enabled and n_unl > 0 and epoch >= pc.warmup_epochs and (epoch - pc.warmup_epochs) % pc.refresh_every == 0:
+                    rec.update(self.refresh_pseudo_labels(epoch))
+                if self.fc.enabled and n_unl > 0 and len(data.calib_idx) and epoch >= self.fc.warmup_epochs and (epoch - self.fc.warmup_epochs) % self.fc.refresh_every == 0:
+                    rec.update(self.refresh_frag(epoch))
+                if refresh:
+                    self._phase_secs["refresh"].append(time.time() - tr0)
+            tr = self._train_epoch(epoch, rec, part)
+            if tr is None:
+                return
+            if self._stop_between_phases(epoch, len(self._epoch_batches), self._epoch_batches, self._epoch_meter, rec, "eval"):
+                return
+            te0 = time.time()
             if "total" not in tr:
                 LOG.warning("epoch %d: every step was skipped for a non-finite loss (%d skipped so far)", epoch + 1, self.skipped)
             ev = self.evaluate(self.model, data.val_ds)
@@ -739,6 +853,7 @@ class Trainer:
             ev_n = self.evaluate(self.model, data.val_ds, sub, noise=True)
             rec["val_noise_cons"] = 1.0 - float(np.mean([cer(ev["preds"][i], ev_n["preds"][i]) for i in sub]))
             rec["val_noise_gap"] = ev_n["cer"] - self._sub_cer(ev, sub)
+            self._phase_secs["eval"].append(time.time() - te0)
             g = tr.get
             rec.update({"lr": self._lr(self.global_step), "lr_rel": self._lr(self.global_step) / self.tc.lr, "vq_lambda": self._vq_lambda(self.global_step),
                         "aux_scale": self._aux_scale(self.global_step), "val_sel_cer": sel_st, "val_ema_sel_cer": sel_em,
@@ -786,14 +901,11 @@ class Trainer:
                      ev["cer"], ev_ema["cer"], sel_st, rec["val_gate_cer"], ev["wer"], ev_tr["cer"], ev["style_mae"], ev.get("style_acc", nan),
                      g("ppl_low", nan), g("ppl_high", nan), self._lr(self.global_step), self.best_cer, self.best_from, self.best_epoch,
                      f" | skipped steps {self.skipped}" if self.skipped else "")
-            epoch_secs.append(time.time() - t0)
             self.completed_epochs = epoch + 1
             if stop:
                 LOG.info("EARLY STOP at epoch %d: no val_sel-CER gain >= %.4f for %d epochs (best %.4f at epoch %d).", epoch + 1, tc.min_delta, tc.patience,
                          self.best_cer, self.best_epoch)
                 break
-        LOG.info("Training done. Best val_sel CER %.4f (%s, epoch %d). Curves: %s", self.best_cer, self.best_from, self.best_epoch, cfg.curve_dir)
-        self._final_source_calibration()
 
     def _final_source_calibration(self) -> None:
         """checkpoints/source_calibration.npz from the BEST weights when training used FRAG-RC (the legacy path writes it at every refresh): the

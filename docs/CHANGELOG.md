@@ -19,6 +19,11 @@ Fixed (full list with locations in `docs/AUDIT_v10_to_v11.md`)
 * Dead computation removed (`style_pred` in `Trainer.evaluate`); style attention is now shown instead of being discarded.
 * One DataLoader iterator per epoch (tqdm.auto started two: twice the workers).
 * The line cache is a memory-mapped file shared by parallel runs and loader workers (no per-run copy of a corpus in RAM).
+* KHATT: label-free ink-band crop of mostly blank line images (53 test lines were unreadable); no `max_text_len` cap (dropped labeled lines 122 -> 3 on iam+rimes+khatt).
+* Exact step-level resume of every training (mid-epoch, SIGTERM, KeyboardInterrupt, deadline); per-loader seeded generators; the zero-shot adapter checkpoints every round.
+* Download and preprocessing cache: offline-first pinned snapshots, a self-sufficient line cache on by default, parallel decoding, caches carried across Kaggle sessions.
+* Clean logs (no self-tests in real runs, no HTTP request lines, one HF token line); derived run names; the epoch budget rule by default.
+* PyTorch practice: `weights_only=True` checkpoints, batched leakage penalty and VQ reset (no per-step host syncs), `inference_mode`, `torch.amp.GradScaler`; torch >= 2.5.
 * Training curves gained FRAG-RC panels (trusted share, per-cell coverage, realised error of trusted characters).
 * The suite summary reports WER, post-hoc and system CER, a component-contribution table, and can re-aggregate without retraining.
 

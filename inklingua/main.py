@@ -33,7 +33,6 @@ def run_single(cfg: Config, base_units: Optional[Sequence[str]] = None) -> Optio
         cfg.llm.source_language = data.primary_language
     if cfg.train.auto_schedule and cfg.run.do_train:
         import json as _json
-        import numpy as _np
         from .schedule import apply_budget, budget, complexity_factor
         lines = [int((data.train_ds.domain == d).sum()) for d in range(len(data.specs))]
         b = budget(len(data.train_ds), complexity_factor(data.specs, lines), cfg.data.batch_size)

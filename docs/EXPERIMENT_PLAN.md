@@ -86,12 +86,15 @@ The run computes its budget from its actual data (after label filtering); the ta
 * Two runs train in parallel, one per T4.  Each run is its own process pinned to its GPU, so memory is released between runs.  The
   LLM (Qwen2.5-1.5B) shares the GPU of the run that needs it.
 * No run starts unless its evaluation reserve plus 30 minutes of training remain: 100 minutes for the full evaluation, 40 for the
-  standard one, 15 for the core one, scaled by the test-set size.  A training run stops at the end of the last epoch that fits.  The
-  session ends about 40 minutes before Kaggle's 12-hour limit.
+  standard one, 15 for the core one, scaled by the test-set size.  A training run stops at the step where its deadline falls, with a step
+  checkpoint (also written every 10 minutes and on SIGTERM).  The session ends about 40 minutes before Kaggle's 12-hour limit.
 * After a run, its checkpoints are pruned.  `best.pt` is kept for the core tier only.  When no pending run needs a corpus any more,
   its downloads and line caches are deleted.
+* Downloads are resolved offline once the pinned files are on disk; each corpus is decoded once (in parallel) into a line cache shared by
+  all its runs.  At the end of a session the caches of unfinished corpora are saved in the output (`_cache/lines`, within the 20 GB
+  limit) and restored by the next session.
 * To continue: add the previous version's output as input, set `RESUME_FROM`, then Save & Run All.  Finished runs are skipped and
-  interrupted runs resume from their last epoch.
+  interrupted runs resume exactly at the step where they stopped (a run stopped by the session end is not counted as a failed attempt).
 
 ## Evaluation depth
 
