@@ -108,7 +108,10 @@ The run computes its budget from its actual data (after label filtering); the ta
 * Downloads are resolved offline once the pinned files are on disk; each corpus is decoded once (in parallel) into a line cache shared by
   all its runs.  At the end of a session the caches of unfinished corpora are saved in the output (`_cache/lines`, within the 20 GB
   limit) and restored by the next session.
-* To continue: add the previous version's output as input, set `RESUME_FROM`, then Save & Run All.  Finished runs are skipped and
+* To continue: Save & Run All again; nothing to edit (`RESUME_FROM = "auto"`).  The notebook resumes from its own work folder (an
+  interactive re-run), else from a previous output attached as input (the most advanced one if several), else -- fully automatic --
+  from the output of the previous completed version, downloaded with the Kaggle API when `KAGGLE_NOTEBOOK` is set and the secrets
+  `KAGGLE_USERNAME` / `KAGGLE_KEY` exist; otherwise it starts from the beginning and says so.  Finished runs are skipped and
   interrupted runs resume exactly at the step where they stopped (a run stopped by the session end is not counted as a failed attempt).
 
 ## Evaluation depth

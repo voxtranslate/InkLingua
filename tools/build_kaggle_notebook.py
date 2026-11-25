@@ -59,8 +59,16 @@ HEADER = r'''# =================================================================
 #    4. a failed run shows the end of its log here; after 4 failures in a row with no finished run the session stops (systematic error).
 #    Everything is in /kaggle/working/inklingua_runs:  paper/RESULTS.md (+ tables, figures, REPRODUCIBILITY.md, STATUS.md), one folder per run.
 #
-#  TO CONTINUE IN THE NEXT SESSION
-#    "Add Input" -> the Output of the previous version of THIS notebook, put its path in RESUME_FROM below, Save & Run All again.
+#  TO CONTINUE IN THE NEXT SESSION -- nothing to edit (RESUME_FROM = "auto"); just "Save Version" -> "Save & Run All" again.  The notebook
+#  finds the previous session by itself, in this order:
+#    1. this session's own work folder (re-running the cell in an interactive session);
+#    2. an attached input that holds a previous output ("Add Input" -> Notebook Output Files -> this notebook); if several are attached,
+#       the most advanced one is used;
+#    3. fully automatic, nothing to attach: set KAGGLE_NOTEBOOK below to "username/notebook-slug" and add two Kaggle secrets
+#       (Add-ons -> Secrets) named KAGGLE_USERNAME and KAGGLE_KEY (your Kaggle API token, kaggle.com -> Settings -> API): each session then
+#       downloads the output of the previous completed version itself.
+#    If none is found, the plan starts from the beginning (and says so).  Finished runs are always skipped, interrupted runs continue
+#    exactly where they stopped.
 #    Cost: the full plan is ~2,400 T4 GPU-hours (~105 sessions).  PLAN_OVERRIDES narrows it, e.g. {"seeds": (1337,)} (one third);
 #    {"dry_run": True} only checks the GPUs and prepares the first corpus (minutes) -- a good first session.
 #
@@ -76,7 +84,8 @@ SETTINGS = r'''
 # ======================================================================================================================================
 #  SETTINGS -- the only lines to edit
 # ======================================================================================================================================
-RESUME_FROM = ""                 # e.g. "/kaggle/input/inklingua-experiment-plan" (the previous version's output); "" on the first session
+RESUME_FROM = "auto"              # "auto": continue from the previous session by itself (see TO CONTINUE above); or a folder path; "" = start over
+KAGGLE_NOTEBOOK = ""             # optional, for FULLY automatic resumption: "your-kaggle-username/this-notebook-slug" (+ secrets, see above)
 PLAN_OVERRIDES: Dict[str, Any] = {}   # e.g. {"seeds": (1337,)}, {"corpora": ("iam", "khatt")}, {"order": "tier"}, {"dry_run": True}; {} = full plan
 '''
 
@@ -164,6 +173,42 @@ def _ensure_fonts(plan: "PlanConfig") -> None:
          f" | Arabic shaping: {'on' if shaping else 'off (arabic-reshaper / python-bidi missing)'} | cache {folder}")
 
 
+def _kaggle_secret(name: str) -> str:
+    try:
+        from kaggle_secrets import UserSecretsClient                # only exists on Kaggle
+        return UserSecretsClient().get_secret(name) or ""
+    except Exception:
+        return ""
+
+
+INPUT_ROOT = "/kaggle/input"
+
+
+def _resolve_resume() -> str:
+    """Where to continue from (see "TO CONTINUE IN THE NEXT SESSION" at the top).  Returns a folder to restore, or "" (nothing to restore)."""
+    if RESUME_FROM != "auto":
+        return RESUME_FROM
+    if os.path.exists(os.path.join(WORK_DIR, "_plan", "state.json")):
+        _log(f"resuming the plan already in {WORK_DIR} (this session)")
+        return ""
+    found = find_previous_output([INPUT_ROOT])
+    if found:
+        _log(f"resuming automatically from the previous output attached as input: {found}")
+        return found
+    ref = KAGGLE_NOTEBOOK or _kaggle_secret("KAGGLE_NOTEBOOK")
+    for k in ("KAGGLE_USERNAME", "KAGGLE_KEY"):
+        if not os.environ.get(k) and _kaggle_secret(k):
+            os.environ[k] = _kaggle_secret(k)
+    if ref:
+        found = download_previous_output(ref, "/tmp/inklingua_previous_output", _log)
+        if found:
+            _log(f"resuming automatically from the previous version of {ref}")
+            return found
+    _log("no previous session found: the plan starts from the beginning.  To resume automatically next time, either attach this "
+         "notebook's output as input, or set KAGGLE_NOTEBOOK and add the secrets KAGGLE_USERNAME / KAGGLE_KEY (see the top of the cell).")
+    return ""
+
+
 def notebook_main() -> None:
     global WORKER_ENTRY
     _ensure_packages()
@@ -172,12 +217,13 @@ def notebook_main() -> None:
     WORKER_ENTRY = [_write_own_source()]                    # run processes execute this cell's code (see worker_command)
     quiet_third_party()                                     # no per-request HTTP lines, no progress bars
     _log(f"Hugging Face Hub: {resolve_hf_token()}")         # HF_TOKEN (environment or Kaggle secret) is exported to every run process
-    plan = PlanConfig(work_dir=WORK_DIR, cache_dir=CACHE_DIR, resume_from=RESUME_FROM, **PLAN_OVERRIDES)
-    if RESUME_FROM:                                         # restore the previous session's output first, so its cached font is reused
-        restore_previous(RESUME_FROM, WORK_DIR, _log)
+    resume = _resolve_resume()
+    plan = PlanConfig(work_dir=WORK_DIR, cache_dir=CACHE_DIR, resume_from=resume, **PLAN_OVERRIDES)
+    if resume:                                              # restore the previous session's output first, so its cached font is reused
+        restore_previous(resume, WORK_DIR, _log)
     _ensure_fonts(plan)
     plan.session_hours = max(0.5, plan.session_hours - (time.time() - SESSION_START) / 3600.0)
-    _log(f"InkLingua v{__version__} | experiment plan | resume_from={RESUME_FROM or '-'} | overrides={PLAN_OVERRIDES or '-'}")
+    _log(f"InkLingua v{__version__} | experiment plan | resume_from={resume or '-'} | overrides={PLAN_OVERRIDES or '-'}")
     res = run_plan(plan, code_root=os.path.join(WORK_DIR, "_plan"), log=_log)
     results = os.path.join(WORK_DIR, "paper", "RESULTS.md")
     if os.path.exists(results):
@@ -186,7 +232,7 @@ def notebook_main() -> None:
             display(Markdown(open(results, encoding="utf-8").read()))
         except Exception:
             print(open(results, encoding="utf-8").read())
-    _log(f"{res['progress']} | paper outputs: {res['paper']} | to continue: add this version's output as input and set RESUME_FROM")
+    _log(f"{res['progress']} | paper outputs: {res['paper']} | to continue: Save & Run All again (the next session resumes by itself)")
 
 
 if __name__ == "__main__":

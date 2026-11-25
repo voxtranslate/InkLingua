@@ -652,6 +652,51 @@ class PlanRunner:
 # ==============================================================================
 # restore a previous session's output (Kaggle: attach the previous version as input)
 # ==============================================================================
+def find_previous_output(roots: Sequence[str] = ("/kaggle/input",), max_depth: int = 6) -> Optional[str]:
+    """The work folder of a previous session among attached inputs: a folder holding `_plan/state.json`.  When several are attached (e.g.
+    two versions), the most advanced one wins (most finished runs, then most started runs, then the newest ledger).  Folders written by an
+    older notebook (no ledger) are ignored."""
+    best: Optional[Tuple[Tuple[int, int, float], str]] = None
+    for root in roots:
+        if not root or not os.path.isdir(root):
+            continue
+        base = os.path.abspath(root).rstrip(os.sep).count(os.sep)
+        for dirpath, dirnames, filenames in os.walk(root):
+            if os.path.abspath(dirpath).count(os.sep) - base >= max_depth:
+                dirnames[:] = []
+            if os.path.basename(dirpath) == "_plan" and "state.json" in filenames:
+                path = os.path.join(dirpath, "state.json")
+                try:
+                    with open(path) as f:
+                        st = json.load(f)
+                except (OSError, ValueError):
+                    continue
+                runs = [v for v in st.values() if isinstance(v, dict)]
+                key = (sum(v.get("status") == "done" for v in runs), sum(v.get("status") != "pending" for v in runs), os.path.getmtime(path))
+                if best is None or key > best[0]:
+                    best = (key, os.path.dirname(dirpath))
+                dirnames[:] = []
+    return best[1] if best else None
+
+
+def download_previous_output(notebook: str, dest: str, log=print) -> Optional[str]:
+    """Fully automatic resumption: download the output of the latest COMPLETED version of `notebook` ("username/notebook-slug") with the
+    Kaggle API (credentials: KAGGLE_USERNAME / KAGGLE_KEY in the environment) and return its work folder, or None."""
+    if not notebook or not (os.environ.get("KAGGLE_USERNAME") and os.environ.get("KAGGLE_KEY")):
+        return None
+    try:
+        os.makedirs(dest, exist_ok=True)
+        from kaggle.api.kaggle_api_extended import KaggleApi       # the Kaggle API client (installed on Kaggle images)
+        api = KaggleApi()
+        api.authenticate()
+        log(f"downloading the output of the previous version of {notebook} (Kaggle API) ...")
+        api.kernels_output(notebook, path=dest)
+    except Exception as e:
+        log(f"could not download the previous output of {notebook}: {e}")
+        return None
+    return find_previous_output([dest])
+
+
 def restore_previous(src: str, dst: str, log=print) -> int:
     if not src:
         return 0

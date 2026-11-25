@@ -33,6 +33,7 @@ Fixed (full list with locations in `docs/AUDIT_v10_to_v11.md`)
 * Figures render Han and Arabic (font fallback, pinned Noto Sans SC when needed, Arabic shaping and right-to-left layout).
 * Baselines: `labeled_only` uses no unlabeled image (it fed the consistency loss before); new `labeled_only_matched` control; 800 runs.
 * Writer self-distillation only in the full evaluation profile; clearer FRAG-RC and calibration log lines.
+* Automatic resumption in the notebook (`RESUME_FROM = "auto"`): own work folder, else an attached previous output, else the previous version's output via the Kaggle API (`KAGGLE_NOTEBOOK` + secrets); figure fonts prepared and cached once per session.
 * Training curves gained FRAG-RC panels (trusted share, per-cell coverage, realised error of trusted characters).
 * The suite summary reports WER, post-hoc and system CER, a component-contribution table, and can re-aggregate without retraining.
 
