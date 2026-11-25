@@ -51,6 +51,9 @@ HEADER = r'''# =================================================================
 #    1. every GPU is checked by a few training steps of the real model on random tensors (drivers / CUDA / cuDNN / memory);
 #    2. every corpus is downloaded once (pinned commit, offline afterwards) and decoded once, in a CPU-only process, into a line cache
 #       shared by all its runs; the caches of unfinished corpora are saved with the output and restored in the next session;
+#    2b. figure fonts are prepared once: a font with Chinese glyphs is downloaded (pinned, sha256-checked) into
+#       /kaggle/working/inklingua_runs/cache/fonts when a Chinese corpus is planned and none is installed, and reused by every run and
+#       every later session; Arabic text in figures is joined and laid out right to left;
 #    3. two runs train in parallel, one per T4, each in its own process; every training writes a step checkpoint at least every
 #       10 minutes and when it is stopped, and resumes EXACTLY at that step (same batches, same random state);
 #    4. a failed run shows the end of its log here; after 4 failures in a row with no finished run the session stops (systematic error).
@@ -143,6 +146,24 @@ def _write_own_source() -> str:
     return path
 
 
+def _ensure_fonts(plan: "PlanConfig") -> None:
+    """Fonts for the figures of every corpus of the plan, prepared ONCE before the runs start: a font with Han glyphs (the pinned,
+    sha256-checked Noto Sans SC is downloaded into <work dir>/cache/fonts when no installed font has them and a Han corpus is planned),
+    DejaVu Sans for Arabic / Hebrew / Cyrillic / Greek, and the Arabic shaping packages.  The cache folder is part of the saved output:
+    the next session (RESUME_FROM) finds the font there and downloads nothing; every run process reuses the same file."""
+    import importlib.util
+    import matplotlib
+    scripts = sorted({DATASETS[k].script for k in plan.corpora if k in DATASETS})
+    folder = os.path.join(WORK_DIR, "cache", "fonts")
+    cached = os.path.exists(os.path.join(folder, "NotoSansSC-Regular.otf"))
+    configure_figure_fonts(scripts, folder)
+    chain = list(matplotlib.rcParams["font.monospace"])
+    han = next((f for f in chain if f.startswith(CJK_FONT_HINTS)), None)
+    shaping = all(importlib.util.find_spec(m) is not None for m in ("arabic_reshaper", "bidi"))
+    _log(f"figure fonts: {' -> '.join(chain)} | Han: {han + (' (cached)' if cached else '') if han else 'none (no Han corpus planned)' if 'Han' not in scripts else 'MISSING: Chinese text drawn as boxes'}"
+         f" | Arabic shaping: {'on' if shaping else 'off (arabic-reshaper / python-bidi missing)'} | cache {folder}")
+
+
 def notebook_main() -> None:
     global WORKER_ENTRY
     _ensure_packages()
@@ -152,6 +173,9 @@ def notebook_main() -> None:
     quiet_third_party()                                     # no per-request HTTP lines, no progress bars
     _log(f"Hugging Face Hub: {resolve_hf_token()}")         # HF_TOKEN (environment or Kaggle secret) is exported to every run process
     plan = PlanConfig(work_dir=WORK_DIR, cache_dir=CACHE_DIR, resume_from=RESUME_FROM, **PLAN_OVERRIDES)
+    if RESUME_FROM:                                         # restore the previous session's output first, so its cached font is reused
+        restore_previous(RESUME_FROM, WORK_DIR, _log)
+    _ensure_fonts(plan)
     plan.session_hours = max(0.5, plan.session_hours - (time.time() - SESSION_START) / 3600.0)
     _log(f"InkLingua v{__version__} | experiment plan | resume_from={RESUME_FROM or '-'} | overrides={PLAN_OVERRIDES or '-'}")
     res = run_plan(plan, code_root=os.path.join(WORK_DIR, "_plan"), log=_log)
