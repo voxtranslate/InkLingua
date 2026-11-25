@@ -10,7 +10,7 @@ from .llm import LLMEngine
 from .model import InkLinguaNet
 from .protocol import write_protocol
 from .style import NUM_DESC
-from .utils import LOG, resolve_device, resolve_llm_device, set_seed, setup_logging
+from .utils import configure_figure_fonts, LOG, resolve_device, resolve_llm_device, set_seed, setup_logging
 
 
 def run_single(cfg: Config, base_units: Optional[Sequence[str]] = None) -> Optional[Dict[str, Any]]:
@@ -25,6 +25,7 @@ def run_single(cfg: Config, base_units: Optional[Sequence[str]] = None) -> Optio
     device = resolve_device(cfg.run.device)
     LOG.info("InkLingua v%s | run dir: %s | device: %s | seed %d | corpora %s", __version__, cfg.run_dir, device, cfg.run.seed, cfg.data.sources)
     data = HandwritingDataModule(cfg, base_units=base_units).prepare()
+    configure_figure_fonts([sp.script for sp in data.specs], os.path.join(cfg.run.work_dir, "cache", "fonts"))
     if not cfg.llm.source_language:
         cfg.llm.source_language = data.primary_language
     if cfg.train.auto_schedule and cfg.run.do_train:

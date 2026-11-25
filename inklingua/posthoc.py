@@ -22,7 +22,7 @@ import torch.nn as nn
 from .data import Collator
 from .decoding import decode_with_space_bonus
 from .explain import adapt_bn_state, bn_layers, load_bn, snapshot_bn
-from .frag import frag_trust_batch
+from .frag import frag_trust_batch_t
 from .model import fragment_distillation
 from .pseudo import PERTURBATIONS, apply_perturbation
 from .style import STYLE_NAMES, assign_nearest, kmeans_np
@@ -335,17 +335,17 @@ class PosthocMixin:
                     o_w = self.model(x, w)
                     o_2 = self.model(apply_perturbation(PERTURBATIONS[views[v2]], x, w), w)
                     B = x.size(0)
-                    trust, _nc, _nt = frag_trust_batch(o_w["log_probs"].float().cpu().numpy(), o_w["aux_log_probs"].float().cpu().numpy(),
-                                                       o_2["log_probs"].float().cpu().numpy(), o_w["out_lens"].cpu().numpy(), batch["stratum"].cpu().numpy(),
-                                                       np.ones(B, bool), self.frag_model, fs["theta"], self.cfg.train.frag.guard_frames)
+                    trust, _nc, _nt = frag_trust_batch_t(o_w["log_probs"].float(), o_w["aux_log_probs"].float(), o_2["log_probs"].float(),
+                                                         o_w["out_lens"], batch["stratum"], torch.ones(B, dtype=torch.bool, device=dev),
+                                                         self.frag_model, fs["theta"], self.cfg.train.frag.guard_frames)
                 o_s = stu(apply_perturbation(PERTURBATIONS[views[v1]], x, w), w)
-                loss = fragment_distillation(o_s["log_probs"], o_w["log_probs"].float(), o_w["out_lens"], torch.from_numpy(trust).to(dev),
+                loss = fragment_distillation(o_s["log_probs"], o_w["log_probs"].float(), o_w["out_lens"], trust,
                                              torch.ones(B, dtype=torch.bool, device=dev), ic.wsd_tau, ic.wsd_anchor)
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(params, 1.0)
                 opt.step()
-                tf.append(float(trust.sum() / max(float(sum(int(l) for l in o_w["out_lens"].cpu().numpy())), 1.0)))
+                tf.append(float(trust.sum()) / max(float(o_w["out_lens"].sum()), 1.0))
                 if step in steps_list:
                     for i, lp in self._read_with(stu, ds, lines).items():
                         out[step][i] = lp

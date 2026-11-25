@@ -30,7 +30,7 @@ from .pseudo import PERTURBATIONS, apply_perturbation
 from .riskcontrol import auroc
 from .style import STYLE_NAMES, assign_nearest, kmeans_np
 from .text import align_chars, bootstrap_cer_ci, cer, edit_distance
-from .utils import LOG, json_safe, to_device, write_csv
+from .utils import fig_text, json_safe, LOG, to_device, write_csv
 
 
 def _ridge_classifier_cv(X: np.ndarray, y: np.ndarray, folds: int = 2, lam: float = 1.0, seed: int = 0) -> float:
@@ -254,7 +254,7 @@ class InterpretMixin:
                         "readings_after_erasure": [ds.display(int(i), t) for t in new_texts], "dependency": D.tolist()})
             fig, ax = plt.subplots(2, 1, figsize=(max(6, min(16, W0 / 80)), 2.2 + 0.18 * len(ids_)), gridspec_kw={"height_ratios": [1, max(1.5, 0.12 * len(ids_))]})
             ax[0].imshow(1 - ink, cmap="gray", aspect="auto"), ax[0].set_yticks([]), ax[0].set_xticks([])
-            ax[0].set_title(f"line {i}: reading '{out[-1]['reading']}'", fontsize=8, loc="left")
+            ax[0].set_title(f"line {i}: reading '{fig_text(out[-1]['reading'])}'", fontsize=8, loc="left")
             ax[1].imshow(D, cmap="Reds", aspect="auto", vmin=0, vmax=1)
             labs = [c if c != " " else "␣" for c in out[-1]["chars"]]
             ax[1].set_xticks(range(len(labs))), ax[1].set_xticklabels(labs, fontsize=6), ax[1].set_yticks(range(len(labs))), ax[1].set_yticklabels(labs, fontsize=6)

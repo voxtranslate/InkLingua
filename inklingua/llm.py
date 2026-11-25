@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import dataclasses
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -20,6 +21,30 @@ LANG_NAMES = {"en": "English", "fr": "French", "es": "Spanish", "de": "German", 
               "pl": "Polish", "ro": "Romanian", "cs": "Czech", "sv": "Swedish", "vi": "Vietnamese", "id": "Indonesian", "fa": "Persian",
               "ur": "Urdu", "ko": "Korean", "el": "Greek", "uk": "Ukrainian", "ca": "Catalan", "la": "Latin", "nb": "Norwegian", "no": "Norwegian",
               "da": "Danish", "et": "Estonian", "he": "Hebrew", "th": "Thai", "bn": "Bengali"}
+
+
+# Scripts a target language is written in (letters of any other script are forbidden in its translations).  Unicode character names start
+# with the script ("LATIN SMALL LETTER E", "CJK UNIFIED IDEOGRAPH-5EFA", "ARABIC LETTER ALEF"); digits, punctuation and spaces are free.
+LANG_SCRIPTS = {"ar": {"ARABIC"}, "fa": {"ARABIC"}, "ur": {"ARABIC"}, "he": {"HEBREW"}, "ru": {"CYRILLIC"}, "uk": {"CYRILLIC"}, "bg": {"CYRILLIC"},
+                "el": {"GREEK"}, "hi": {"DEVANAGARI"}, "mr": {"DEVANAGARI"}, "zh": {"CJK", "LATIN"}, "ja": {"CJK", "HIRAGANA", "KATAKANA", "LATIN"},
+                "ko": {"HANGUL", "CJK", "LATIN"}}
+_WIDE_FORMS = ("CJK", "FULLWIDTH", "HALFWIDTH", "IDEOGRAPHIC")
+
+
+def target_scripts(code: str) -> set:
+    s = set(LANG_SCRIPTS.get(code, {"LATIN"}))
+    return s | ({"FULLWIDTH", "HALFWIDTH", "IDEOGRAPHIC"} if "CJK" in s else set())
+
+
+def text_in_scripts(text: str, allowed: set) -> bool:
+    """True when every letter of `text` (and every CJK / full-width form, which are punctuation-like) belongs to an allowed script."""
+    for ch in text:
+        name = unicodedata.name(ch, "")
+        head = name.split(" ")[0] if name else ""
+        if head.startswith(_WIDE_FORMS) or unicodedata.category(ch).startswith("L"):
+            if not any(head.startswith(a) for a in allowed):
+                return False
+    return True
 
 
 def lang_name(code: str) -> str:
@@ -177,13 +202,30 @@ class LLMEngine:
                     raise KeyError(f"no seq2seq model configured for {c.source_language}->{c.target_language}: add the key "
                                    f"'{c.source_language}-{c.target_language}' to cfg.llm.seq2seq_models, or use backend='causal'")
                 cls = AutoModelForSeq2SeqLM
-            dtype = torch.float16 if self.device.type == "cuda" else torch.float32
-            LOG.info("Loading pretrained %s model '%s' (auto-download on first use) ...", c.backend, name)
-            self.tok = AutoTokenizer.from_pretrained(name)
             try:
-                model = cls.from_pretrained(name, dtype=dtype)
-            except TypeError:
-                model = cls.from_pretrained(name, torch_dtype=dtype)
+                import transformers as _tf
+                _tf.utils.logging.set_verbosity_error()              # no weight-loading progress bar, no advisory warnings in the run log
+                _tf.utils.logging.disable_progress_bar()
+            except Exception:
+                pass
+            dtype = torch.float16 if self.device.type == "cuda" else torch.float32
+            rev = (c.model_revisions or {}).get(name) or "main"
+            self.revision = rev
+            kw: Dict[str, Any] = {"revision": rev}
+
+            def load(local: bool):
+                tok = AutoTokenizer.from_pretrained(name, local_files_only=local, **kw)
+                try:
+                    mdl = cls.from_pretrained(name, dtype=dtype, local_files_only=local, **kw)
+                except TypeError:
+                    mdl = cls.from_pretrained(name, torch_dtype=dtype, local_files_only=local, **kw)
+                return tok, mdl
+            try:                                                      # the pinned files already on disk: no network request at all
+                self.tok, model = load(True)
+                LOG.info("pretrained %s model '%s' @ %s loaded from the local cache", c.backend, name, rev[:10])
+            except Exception:
+                LOG.info("Downloading pretrained %s model '%s' @ %s (once; cached for the next runs) ...", c.backend, name, rev[:10])
+                self.tok, model = load(False)
             self.model = model.to(self.device).eval()
             if self.tok.pad_token is None:
                 self.tok.pad_token = self.tok.eos_token
@@ -262,6 +304,32 @@ class LLMEngine:
         msgs.append({"role": "user", "content": user})
         return msgs, marked
 
+    def _script_processor(self, target_language: str):
+        """A logits processor that forbids every token whose text contains a letter of a script that the target language is not written in
+        (e.g. Han or Cyrillic in a French translation).  Built once per (model, script) from the tokenizer's vocabulary."""
+        allowed = target_scripts(target_language)
+        cache = self.__dict__.setdefault("_script_masks", {})
+        key = tuple(sorted(allowed))
+        if key not in cache:
+            vocab = self.model.get_output_embeddings().weight.shape[0]
+            n_tok = len(self.tok)
+            texts = self.tok.batch_decode([[i] for i in range(min(vocab, n_tok))], skip_special_tokens=False)
+            partial_ok = "CJK" in allowed                     # byte tokens (decoding to U+FFFD) can spell rare Han characters: only for Han targets
+            bad = torch.tensor([(not text_in_scripts(t, allowed)) or ("\ufffd" in t and not partial_ok) for t in texts]
+                               + [True] * max(0, vocab - n_tok), dtype=torch.bool)
+            for sid in (self.tok.eos_token_id, self.tok.pad_token_id):            # the end of the answer must stay possible
+                if sid is not None and sid < len(bad):
+                    bad[sid] = False
+            cache[key] = bad.to(self.device)
+            LOG.info("[SCRIPT-LOCK] %s translation: %d of %d vocabulary tokens forbidden (letters outside %s)", lang_name(target_language),
+                     int(bad.sum()), len(bad), "/".join(sorted(allowed)))
+        mask = cache[key]
+
+        class _ForbidScripts:
+            def __call__(self, input_ids, scores):
+                return scores.masked_fill(mask[:scores.shape[-1]], float("-inf"))
+        return _ForbidScripts()
+
     @staticmethod
     def _clean(out: str) -> str:
         out = out.strip().replace("[?]", "")
@@ -294,7 +362,10 @@ class LLMEngine:
             msgs, marked = self._messages(hyps, uncertain, c, detok)
             prompt = self.tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
             inp = self.tok(prompt, return_tensors="pt").to(self.device)
-            out = self.model.generate(**inp, max_new_tokens=c.max_new_tokens, do_sample=False, pad_token_id=self.tok.pad_token_id)
+            gen_kw: Dict[str, Any] = {}
+            if c.script_constrained:
+                gen_kw["logits_processor"] = [self._script_processor(c.target_language)]
+            out = self.model.generate(**inp, max_new_tokens=c.max_new_tokens, do_sample=False, pad_token_id=self.tok.pad_token_id, **gen_kw)
             txt = self._clean(self.tok.decode(out[0, inp["input_ids"].shape[1]:], skip_special_tokens=True))
             return {"translation": txt, "marked_text": marked, "candidates": [txt]}
         use = hyps[:c.nbest] if uncertain else hyps[:1]

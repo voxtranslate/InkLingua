@@ -47,10 +47,10 @@ cfg.train.init_from = "inklingua_runs/inklingua_iam/checkpoints/best.pt"; cfg.da
 code -- every class and function of the package, one section per module in reading order, with a table of contents -- and one entry
 point (`notebook_main`).  It is self-contained: it needs neither this repository nor any package of it, and contains no test code
 and no generated data.  Each run executes in its own process from the cell's own source, written to `_plan/inklingua_notebook.py`.  It runs
-the complete experiment plan on the real corpora (5 core variants, 14 training ablations and a label-budget sweep, for every corpus and 3
+the complete experiment plan on the real corpora (6 core variants, 14 training ablations and a label-budget sweep, for every corpus and 3
 seeds; then a joint model and a zero-shot adaptation stage), two runs in parallel on the two T4s, and resumes in the next session.  It
 writes the paper tables (Markdown, LaTeX, CSV), figures, statistics and a reproducibility report.  See `docs/EXPERIMENT_PLAN.md`,
-including its cost: the full plan is about 2,350 T4 GPU-hours (`PLAN_OVERRIDES = {"dry_run": True}` checks the GPUs and prepares the
+including its cost: the full plan is about 2,400 T4 GPU-hours (`PLAN_OVERRIDES = {"dry_run": True}` checks the GPUs and prepares the
 first corpus in minutes).  The package is the source of truth; regenerate the notebook after changing it with
 `python tools/build_kaggle_notebook.py`.
 

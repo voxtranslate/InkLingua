@@ -21,6 +21,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Sequence, Tuple
 
 import numpy as np
+import torch
 
 from .riskcontrol import char_risk_threshold, fit_logistic, sigmoid
 from .text import align_chars
@@ -142,8 +143,13 @@ def fragment_mask(T: int, st: np.ndarray, en: np.ndarray, risky: np.ndarray, gua
     for k in range(K):
         if not rel[k]:
             bad[st[k]:en[k]] = True
-    if guard > 0 and bad.any():
-        bad = np.convolve(bad.astype(np.float64), np.ones(2 * guard + 1), mode="same") > 0
+    if guard > 0 and bad.any():                              # dilate by `guard` frames, same length (np.convolve 'same' would return
+        idx = np.flatnonzero(bad)                            # max(T, 2*guard+1) samples and break lines shorter than the kernel)
+        lo, hi = np.clip(idx - guard, 0, T), np.clip(idx + guard + 1, 0, T)
+        d = np.zeros(T + 1, np.int64)
+        np.add.at(d, lo, 1)
+        np.add.at(d, hi, -1)
+        bad = np.cumsum(d)[:T] > 0
     return trust & ~bad
 
 
@@ -173,6 +179,109 @@ def frag_trust_batch(lp_w: np.ndarray, aux_w: np.ndarray, lp_s: np.ndarray, lens
         n_ch += len(ids)
         n_tr += int((~risky).sum())
     return trust, n_ch, n_tr
+
+
+def frag_trust_batch_t(lp_w: torch.Tensor, aux_w: torch.Tensor, lp_s: torch.Tensor, lens: torch.Tensor, strat: torch.Tensor, rows: torch.Tensor,
+                       model: FragModel, theta: Sequence[float], guard: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """frag_trust_batch on the device, without a Python loop over lines or characters and without a host synchronisation: the same
+    evidence (char_evidence), the same risk model and per-cell thresholds, the same fragments (fragment_mask).
+
+    Why: the per-line NumPy version copied three [B, T, V] posteriors to the host on every training step and walked every emitted
+    character in Python; on the 3-corpus Kaggle run an epoch took ~1,500 s for 1,327 steps.  Here every quantity is a run-level
+    reduction over the frames of the batch (a run = maximal stretch of frames with the same arg-max symbol; an emitted character = a
+    non-blank run).  Inputs: [B, T, V] log-posteriors (weak view, inter-CTC head on the weak view, strong view), lens [B], strat [B],
+    rows [B] bool.  Returns (trust [B, T] bool, emitted characters, trusted characters) as device tensors."""
+    dev = lp_w.device
+    B, T, _V = lp_w.shape
+    tt = torch.arange(T, device=dev)
+    lens = lens.to(dev).long()
+    valid = (tt[None, :] < lens[:, None]) & rows.to(dev).bool()[:, None]                     # [B, T]
+    pw = lp_w.float().exp()
+    top = pw.topk(2, dim=-1)
+    mp, idx, sec = top.values[..., 0], top.indices[..., 0], top.values[..., 1]
+    ia, is_, pb = aux_w.argmax(-1), lp_s.argmax(-1), pw[..., 0]
+    prev = torch.cat([torch.full((B, 1), -1, dtype=idx.dtype, device=dev), idx[:, :-1]], 1)
+    new_run = valid & (prev != idx)
+    vf = valid.reshape(-1)
+    pos = vf.nonzero().squeeze(1)                                                            # flat positions of the valid frames
+    zero_b = torch.zeros(B, T, dtype=torch.bool, device=dev)
+    if pos.numel() == 0:
+        z = torch.zeros((), dtype=torch.long, device=dev)
+        return zero_b, z, z
+    rid = (new_run.reshape(-1).long().cumsum(0) - 1)[pos]                                    # run id of every valid frame
+    nR = pos.numel()                                         # an upper bound of the number of runs (padding runs have length 0)
+    b_f, t_f = pos // T, pos % T
+    idx_f, mp_f = idx.reshape(-1)[pos], mp.reshape(-1)[pos]
+    ia_f, is_f, pb_f = ia.reshape(-1)[pos], is_.reshape(-1)[pos], pb.reshape(-1)[pos]
+
+    def red(src: torch.Tensor, how: str, init: float) -> torch.Tensor:
+        out = torch.full((nR,), init, dtype=src.dtype, device=dev)
+        return out.scatter_reduce(0, rid, src, reduce=how, include_self=True)
+    big = torch.iinfo(torch.long).max
+    start = red(t_f, "amin", big)                                                            # first frame of the run
+    length = torch.zeros(nR, dtype=torch.long, device=dev).scatter_add(0, rid, torch.ones_like(rid))
+    exists = length > 0                                                                      # runs beyond the last one are padding
+    start = torch.where(exists, start, torch.zeros_like(start))
+    line = red(b_f, "amin", big).clamp(max=B - 1)
+    char = torch.zeros(nR, dtype=idx_f.dtype, device=dev).scatter(0, rid, idx_f)
+    end = start + length                                                                     # exclusive
+    peak = red(mp_f, "amax", -1.0)
+    at_peak = mp_f == peak[rid]
+    pk_t = red(torch.where(at_peak, t_f, torch.full_like(t_f, big)), "amin", big).clamp(max=T - 1)
+    sec_pk = sec.reshape(-1)[line * T + pk_t]
+    aux_agree = torch.zeros(nR, dtype=torch.float32, device=dev).scatter_add(0, rid, (ia_f == idx_f).float()) / length.clamp(min=1)
+    inside = red((is_f == idx_f).long(), "amax", 0) > 0
+    L_line = lens[line]
+    left_ok = (start > 0) & (is_.reshape(-1)[line * T + (start - 1).clamp(min=0)] == char)
+    right_ok = (end < L_line) & (is_.reshape(-1)[line * T + end.clamp(max=T - 1)] == char)
+    view_agree = (inside | left_ok | right_ok).float()
+    min_pb = red(pb_f, "amin", 2.0)
+    ar = torch.arange(nR, device=dev)
+    same_prev = (ar > 0) & exists & torch.cat([exists[:1] & False, exists[:-1]]) & (line == torch.cat([line[:1], line[:-1]]))
+    same_next = (ar < nR - 1) & exists & torch.cat([exists[1:], exists[-1:] & False]) & (line == torch.cat([line[1:], line[-1:]]))
+    emitted = exists & (char != 0)
+    blank_prev = same_prev & (torch.cat([char[:1], char[:-1]]) == 0)
+    blank_next = same_next & (torch.cat([char[1:], char[-1:]]) == 0)
+    gap_prev = torch.where(blank_prev, torch.cat([min_pb[:1], min_pb[:-1]]), torch.full_like(min_pb, 2.0))
+    gap_next = torch.where(blank_next, torch.cat([min_pb[1:], min_pb[-1:]]), torch.full_like(min_pb, 2.0))
+    mb = torch.minimum(gap_prev, gap_next)
+    mb = torch.where(mb > 1.5, torch.ones_like(mb), mb)                                      # no adjacent gap -> 1.0 (as in char_evidence)
+
+    def logit(p: torch.Tensor) -> torch.Tensor:
+        p = p.double().clamp(1e-4, 1.0 - 1e-4)
+        return torch.log(p / (1.0 - p))
+    # features of the emitted characters, in reading order (runs are ordered line by line, frame by frame)
+    E = emitted.nonzero().squeeze(1)
+    f0 = logit(peak[E])
+    eline = line[E]
+    pe = torch.cat([E[:1], E[:-1]]) if E.numel() else E
+    ne = torch.cat([E[1:], E[-1:]]) if E.numel() else E
+    f0_prev = torch.where(line[pe] == eline, logit(peak[pe]), f0) if E.numel() else f0
+    f0_next = torch.where(line[ne] == eline, logit(peak[ne]), f0) if E.numel() else f0
+    X = torch.stack([f0, (peak[E] - sec_pk[E]).double(), aux_agree[E].double(), view_agree[E].double(),
+                     torch.minimum(torch.minimum(f0_prev, f0), f0_next), torch.log(length[E].clamp(min=1).double()), logit(mb[E])], 1)
+    mu, sd, bb = (torch.as_tensor(a, dtype=torch.float64, device=dev) for a in (model.mu, model.sd, model.b))
+    risk = torch.sigmoid(bb[0] + ((X - mu) / sd) @ bb[1:])
+    if len(theta) == 0:
+        th = torch.full_like(risk, float("-inf"))
+    else:
+        th_t = torch.as_tensor(np.asarray(theta, np.float64), device=dev)
+        th = th_t[strat.to(dev).long()[eline].clamp(0, len(theta) - 1)]
+    rel_e = risk <= th                                                                      # NaN risk -> not reliable
+    rel = torch.zeros(nR, dtype=torch.bool, device=dev)
+    rel[E] = rel_e
+    rel_prev, rel_next = torch.cat([rel[:1] & False, rel[:-1]]), torch.cat([rel[1:], rel[-1:] & False])
+    blank_trust = (same_prev & same_next & rel_prev & rel_next) | (~same_prev & same_next & rel_next) | (same_prev & ~same_next & rel_prev)
+    run_trust = torch.where(emitted, rel, exists & (char == 0) & blank_trust)
+    trust = torch.zeros(B * T, dtype=torch.bool, device=dev)
+    trust[pos] = run_trust[rid]
+    bad = torch.zeros(B * T, dtype=torch.float32, device=dev)
+    bad[pos] = (emitted & ~rel)[rid].float()
+    bad = bad.view(B, 1, T)
+    if guard > 0:
+        bad = torch.nn.functional.max_pool1d(bad, 2 * guard + 1, stride=1, padding=guard)
+    trust = trust.view(B, T) & ~(bad.view(B, T) > 0) & valid
+    return trust, emitted.sum(), rel_e.sum()
 
 
 def fit_trust_rule(X: np.ndarray, y: np.ndarray, line: np.ndarray, cell: np.ndarray, n_cells: int, target: float, z: float, min_chars: int,

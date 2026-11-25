@@ -14,3 +14,5 @@ sentencepiece>=0.1.99
 sacremoses>=0.0.53
 # tests
 pytest>=7
+arabic-reshaper>=3.0              # Arabic text in figures (joined letters)
+python-bidi>=0.4                  # right-to-left layout of figure text

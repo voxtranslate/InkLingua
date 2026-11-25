@@ -893,10 +893,41 @@ def run_self_tests(verbose: bool = True) -> None:
     assert list(_tr.tqdm(_CountIt(), disable=True)) == [0, 1, 2] and _n_it["n"] == 1
     shutil.rmtree(tmpd, ignore_errors=True)
     ok("experiment plan: budget rule (IAM = v10 defaults), corpus-major plan, pooled paired bootstrap / Holm / sign test, block caps, decontamination, parquet reader, memory-mapped line cache, one loader iterator")
+    _test_frag_vectorised()
+    ok("vectorised FRAG-RC trust rule (device) == the per-line NumPy rule on 120 random batches, incl. lines shorter than the guard kernel")
     _test_exact_resume()
     ok("exact step-level resume: a run stopped in the middle of an epoch (SIGTERM) and restarted ends with the same weights, EMA and "
        "history as an uninterrupted run; ink-band crop of mostly blank line images")
     LOG.info("%d self-tests passed in %.1fs", len(done), time.time() - t0)
+
+
+def _test_frag_vectorised() -> None:
+    from .frag import frag_trust_batch, frag_trust_batch_t
+    rng = np.random.RandomState(7)
+
+    def posteriors(B: int, T: int, V: int) -> np.ndarray:
+        lp = np.full((B, T, V), -8.0)
+        for b in range(B):
+            t = 0
+            while t < T:
+                c, L, p = (0 if rng.rand() < 0.45 else rng.randint(1, V)), rng.randint(1, 5), rng.uniform(0.3, 0.99)
+                for k in range(t, min(T, t + L)):
+                    row = rng.dirichlet(np.ones(V)) * (1 - p)
+                    row[c] += p
+                    lp[b, k] = np.log(row + 1e-9)
+                t += L
+        return lp
+    for trial in range(120):
+        B, T, V = rng.randint(1, 8), rng.randint(1, 60), rng.randint(3, 12)
+        lw, la, ls = posteriors(B, T, V), posteriors(B, T, V), posteriors(B, T, V)
+        ls, la = np.where(rng.rand(B, T, 1) < 0.7, lw, ls), np.where(rng.rand(B, T, 1) < 0.8, lw, la)
+        lens, strat, rows = rng.randint(0, T + 1, B), rng.randint(0, 4, B), rng.rand(B) < 0.8
+        fm = FragModel(rng.randn(7), np.abs(rng.randn(7)) + 0.5, rng.randn(8))
+        theta = list(rng.uniform(0, 1, 3)) + ([float("-inf")] if trial % 7 == 0 else [])
+        g = int(rng.randint(0, 3))
+        a, nc, nt = frag_trust_batch(lw, la, ls, lens, strat, rows, fm, theta, g)
+        b_, nc2, nt2 = frag_trust_batch_t(*(torch.tensor(x) for x in (lw, la, ls, lens, strat, rows)), fm, theta, g)
+        assert np.array_equal(a, b_.numpy()) and (nc, nt) == (int(nc2), int(nt2)), f"trial {trial}: vectorised trust rule differs"
 
 
 def _test_exact_resume() -> None:

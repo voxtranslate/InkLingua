@@ -18,7 +18,7 @@ Inside a corpus, seed 1 is completed before seed 2 starts (all tables have a fir
 
 | tier | runs | what they establish |
 |---|---|---|
-| core (5) | `labeled_only`, `ctc_only`, `legacy_pl`, `full`, `full_supervised` | the main table: does the unlabeled data help, compared with the previous method and with the 100 %-label upper bound? |
+| core (6) | `labeled_only`, `labeled_only_matched`, `ctc_only`, `legacy_pl`, `full`, `full_supervised` | the main table: does the unlabeled data help, compared with the previous method and with the 100 %-label upper bound? |
 | ablation (14) | `no_frag`, `no_strata`, `no_sharpen`, `no_mixline`, `no_style_task`, `no_ses`, `no_vq`, `no_film`, `no_confusion`, `no_frame_cons`, `no_mask`, `no_aux_ctc`, `no_v9_reg`, `no_hscale` | the contribution of every trained component of the method |
 | label budget (4) | `labeled_only` and `full` at 5 % and 10 % labels | the label-budget curves (30 % and 100 % come from the core tier) |
 
@@ -27,7 +27,13 @@ validation lines, cross-split decontamination, corpus-balanced sampling 0.5).  T
 retraining from scratch, to French (RIMES) and Catalan (Esposalles) line images, and measures the CER against 0, 25, 100 and 200 labeled
 target lines.
 
-Default: 3 seeds (1337, 1338, 1339), 30 % labels, **767 runs**.
+Default: 3 seeds (1337, 1338, 1339), 30 % labels, **800 runs**.
+
+`labeled_only` trains on the whole label budget and uses no unlabeled image at all (no consistency, style or masked-code loss on
+unlabeled lines: before v11.1 it did, which made the baseline partly semi-supervised).  `labeled_only_matched` trains on exactly
+the labeled lines that `full` trains on (the 10 % calibration share is held out and unused), so T2 separates the effect of the
+unlabeled lines from the cost of calibration.  Measured on IAM before these changes (3 seeds, old notebook): `full` 9.36 ± 0.16 %
+vs `labeled_only` 9.15 ± 0.24 % test CER -- the method did not beat the baseline there.
 
 ### What is deliberately not retrained
 
@@ -110,7 +116,7 @@ The run computes its budget from its actual data (after label filtering); the ta
 | profile | used for | contents |
 |---|---|---|
 | full | `full`, first seed, every corpus and the joint model | everything: post-hoc options incl. WSD, LLM rescoring, translation, interpretability, robustness, the run report |
-| standard | the other core runs | metrics, every post-hoc option incl. WSD and LLM rescoring (the system CER) |
+| standard | the other core runs | metrics, the validated post-hoc options (no WSD: never adopted in the IAM suite, ~8 min per run) and LLM rescoring (the system CER) |
 | core | ablations, label-budget runs | metrics and the cheap post-hoc options (no WSD, no LLM) |
 
 ## Outputs (`/kaggle/working/inklingua_runs/paper/`, rebuilt after every finished run)
@@ -134,7 +140,7 @@ Every `.md` table also exists as `.tex` (booktabs) and `.csv`.
 
 ## Cost (be aware before starting)
 
-With the prior of 0.15 s per step on a T4, and early stopping at about 75 % of the budget, the full plan is about **2,350 GPU-hours**.
+With the prior of 0.15 s per step on a T4, and early stopping at about 75 % of the budget, the full plan is about **2,415 GPU-hours**.
 With two GPUs per session that is roughly 1,150 session-hours, i.e. about 100 Kaggle sessions.  The free weekly GPU quota does not
 cover that in less than many months.  The estimate printed at the start of every session uses measured rates as soon as runs finish.
 `PLAN_OVERRIDES` in the notebook narrows the plan without touching the code, for example:

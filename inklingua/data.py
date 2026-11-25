@@ -1158,6 +1158,9 @@ class HandwritingDataModule:
                 s_[m] = np.digitize(hard[k][m], cuts) + (d * n_str if per_dom else 0)
             strat[k] = s_
         self.n_strata = n_str * (len(self.specs) if per_dom else 1)
+        # readable names of the Mondrian cells: corpus / hardness tertile (h0 = thickest strokes, widest gaps ... h2 = thinnest, tightest)
+        self.cell_names = ([f"{sp.key}/h{t}" for sp in self.specs for t in range(n_str)] if per_dom
+                           else [f"all/h{t}" for t in range(n_str)])
         self.labeled_idx = np.flatnonzero(tr_lab_fit)
         self.calib_idx = np.flatnonzero(calib)
         self.unlabeled_idx = np.flatnonzero(~tr_lab)

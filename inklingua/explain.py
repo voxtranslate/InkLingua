@@ -18,6 +18,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
 from .model import MaskedBatchNorm2d
+from .utils import fig_text
 
 SPACE = "␣"
 ALIGN_CAP = 1000          # max #lines used for the O(n*m) character alignments (confusions, calibration)
@@ -141,7 +142,7 @@ def viz_input(ax, ctx):
     _show_img(ax, ctx)
     sp, st = ctx["style_pred"], ctx["style_true"]
     tag = f"[{ctx['tag']}] " if ctx.get("tag") else ""
-    ax.set_title(f"{tag}GT  : {ctx['gt_display']}\nPRED: {ctx['pred_display']}   (CER {ctx['cer']:.3f}, conf {ctx['conf']:.2f})\n"
+    ax.set_title(f"{tag}GT  : {fig_text(ctx['gt_display'])}\nPRED: {fig_text(ctx['pred_display'])}   (CER {ctx['cer']:.3f}, conf {ctx['conf']:.2f})\n"
                  f"style pred/measured  slant {sp[0]:+.0f}/{st[0]:+.0f} deg | stroke {sp[1]:.3f}/{st[1]:.3f} | gap {sp[3]:.2f}/{st[3]:.2f} | "
                  f"body {sp[4]:.2f}/{st[4]:.2f}   (nan = not measurable)", fontsize=8, loc="left")
     ax.set_yticks([])

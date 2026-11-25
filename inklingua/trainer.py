@@ -23,7 +23,7 @@ from .config import Config
 from .curves import plot_training_curves
 from .data import HandwritingDataModule, HandwritingDataset
 from .decoding import greedy_decode, seq_confidence
-from .frag import FRAG_FEATURES, FragModel, cell_theta, char_evidence, char_wrong_labels, fit_trust_rule, frag_trust_batch
+from .frag import FRAG_FEATURES, FragModel, cell_theta, char_evidence, char_wrong_labels, fit_trust_rule, frag_trust_batch_t
 from .llm import LLMEngine, fuse_scores
 from .model import ClosedFormLeakage, GPUAugment, InkLinguaNet, ModelEMA, compute_losses
 from .pseudo import PERTURBATIONS, RELIABILITY_FEATURES, PseudoLabelBank, SelectionRule, apply_perturbation, eval_noise, reliability_features, reliability_views
@@ -321,8 +321,9 @@ class Trainer:
         ps, lab = L["_ctc_ps"].detach().float(), batch["labeled"]
         pl = (~lab) & (batch["weight"] > 0)
         leak = self.leak.last_vals if self.leak.last_vals is not None else ps.new_zeros(0)
+        fr = ([frag["trusted_frames"], frag["frames"], frag["n_trusted_chars"], frag["n_chars"]] if frag is not None else [])
         head = torch.stack([L[k].detach().float() for k in keys] + [gn.detach().float(), out["ppl_low"].detach().float(), out["ppl_high"].detach().float(),
-                            (ps * lab).sum(), lab.sum().float(), (ps * pl).sum(), pl.sum().float()])
+                            (ps * lab).sum(), lab.sum().float(), (ps * pl).sum(), pl.sum().float()] + [x.float() for x in fr])
         v = torch.cat([head, leak.float(), ps, pl.float()]).cpu().numpy()          # the one host transfer of the step
         nk = len(keys)
         for k, x in zip(keys, v[:nk]):
@@ -334,13 +335,15 @@ class Trainer:
         meter.add("ppl_high", float(v[nk + 2]), 1)
         s_lab, n_lab, s_pl, n_pl = (float(x) for x in v[nk + 3:nk + 7])
         o = nk + 7
+        if frag is not None:
+            tfr, nfr, tch, nch = (float(x) for x in v[o:o + 4])
+            meter.add("frag_trust", tfr / max(nfr, 1.0), 1)
+            meter.add("frag_char_trust", tch / max(nch, 1.0), 1)
+            o += 4
         for j, x in zip(self.leak.active if len(leak) else [], v[o:o + len(leak)]):
             meter.add(f"leak_r2_{j}", float(x), 1)
         o += len(leak)
         ps_h, pl_h = v[o:o + B], v[o + B:o + 2 * B] > 0.5
-        if frag is not None:
-            meter.add("frag_trust", frag["trusted_frames"] / max(frag["frames"], 1), 1)
-            meter.add("frag_char_trust", frag["n_trusted_chars"] / max(frag["n_chars"], 1), 1)
         if n_lab > 0:
             meter.add("ctc_labeled", s_lab / n_lab, int(n_lab))
         if n_pl > 0:
@@ -615,11 +618,19 @@ class Trainer:
                     ms = (u["strat"] == s) & keep
                     info[f"frag_unl_err_sel_s{s}"] = float(u["y"][ms].mean()) if ms.any() else float("nan")
                     info[f"frag_unl_cov_s{s}"] = float(keep[u["strat"] == s].mean()) if (u["strat"] == s).any() else float("nan")
-        LOG.info("[FRAG-RC] epoch %d | %d calibration chars (error %.3f), AUROC risk %.3f vs peak prob %.3f | per cell: coverage %s, error of trusted "
-                 "chars %s (target %.3f) | UNLABELED sample (hidden text): trusted %.2f of chars at error %.4f (all chars %.4f) | emphasis %s", epoch, len(y),
-                 y.mean(), info["frag_auroc_risk"], info["frag_auroc_conf"], [round(info[f"frag_cal_cov_s{s}"], 2) for s in range(S)],
-                 [round(info[f"frag_cal_err_sel_s{s}"], 4) for s in range(S)], fc.target_err, info.get("frag_unl_cov", float("nan")),
-                 info.get("frag_unl_err_sel", float("nan")), info.get("frag_unl_err_all", float("nan")), np.round(self.stratum_w, 2).tolist())
+        names = getattr(self.data, "cell_names", None) or [f"cell {k}" for k in range(S)]
+
+        def cell_desc(k: int) -> str:
+            cov, n_c = info[f"frag_cal_cov_s{k}"], int(info.get(f"frag_cal_chars_s{k}", 0))
+            if cov > 0:
+                return f"{names[k]} {100 * cov:.0f}% of {n_c:,} chars (err {info[f'frag_cal_err_sel_s{k}']:.4f})"
+            why = "too few calibration chars" if n_c < fc.min_chars else f"no threshold meets the {fc.target_err:.3f} bound"
+            return f"{names[k]} 0% of {n_c:,} chars ({why})"
+        LOG.info("[FRAG-RC] epoch %d | %d calibration chars (error %.3f), AUROC risk %.3f vs peak prob %.3f | trusted per cell (target error %.3f): "
+                 "%s | UNLABELED sample (hidden text): trusted %.2f of chars at error %.4f (all chars %.4f) | emphasis %s", epoch, len(y), y.mean(),
+                 info["frag_auroc_risk"], info["frag_auroc_conf"], fc.target_err, "; ".join(cell_desc(k) for k in range(S)),
+                 info.get("frag_unl_cov", float("nan")), info.get("frag_unl_err_sel", float("nan")), info.get("frag_unl_err_all", float("nan")),
+                 np.round(self.stratum_w, 2).tolist())
         return info
 
     def _frag_batch(self, t_out: Dict[str, Any], x_s: torch.Tensor, wd: torch.Tensor, rows: torch.Tensor, stratum: torch.Tensor) -> Optional[Dict[str, Any]]:
@@ -631,16 +642,15 @@ class Trainer:
         teacher = self.ema.module.eval()
         with torch.no_grad(), torch.autocast(device_type=dev.type, dtype=self.amp_dtype, enabled=self.use_amp):
             s_out = teacher(x_s[ridx], wd[ridx])
-        lp_w, aux_w = t_out["log_probs"].float().cpu().numpy(), t_out["aux_log_probs"].float().cpu().numpy()
-        lp_s = np.zeros_like(lp_w)
-        ls = s_out["log_probs"].float().cpu().numpy()
-        lp_s[ridx.cpu().numpy(), :ls.shape[1]] = ls[:, :lp_s.shape[1]]
-        lens = t_out["out_lens"].cpu().numpy()
-        trust, n_ch, n_tr = frag_trust_batch(lp_w, aux_w, lp_s, lens, stratum.cpu().numpy(), rows.cpu().numpy(), self.frag_model,
-                                             self.frag_state["theta"], fc.guard_frames)
-        valid_rows = int(sum(lens[b] for b in ridx.cpu().numpy()))
-        return {"trust": torch.from_numpy(trust).to(dev), "rows": rows, "tau": fc.sharpen, "anchor": fc.anchor_weight, "n_chars": n_ch,
-                "n_trusted_chars": n_tr, "trusted_frames": int(trust.sum()), "frames": valid_rows}
+        lp_w = t_out["log_probs"].float()
+        lp_s = torch.zeros_like(lp_w)
+        ls = s_out["log_probs"].float()
+        lp_s[ridx, :ls.shape[1]] = ls[:, :lp_s.shape[1]]
+        lens = t_out["out_lens"]
+        trust, n_ch, n_tr = frag_trust_batch_t(lp_w, t_out["aux_log_probs"].float(), lp_s, lens, stratum, rows, self.frag_model,
+                                               self.frag_state["theta"], fc.guard_frames)     # on the device, no host synchronisation
+        return {"trust": trust, "rows": rows, "tau": fc.sharpen, "anchor": fc.anchor_weight, "n_chars": n_ch, "n_trusted_chars": n_tr,
+                "trusted_frames": trust.sum(), "frames": lens[ridx].sum()}
 
     # ------------------------------------------------------------------ checkpoints
     def _compat(self) -> Dict[str, Any]:

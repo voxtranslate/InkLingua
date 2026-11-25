@@ -299,6 +299,10 @@ class LLMConfig:
     device: str = "auto"                       # "auto" = the SECOND GPU when there are two (Kaggle T4 x2: recogniser on cuda:0, LLM on cuda:1),
                                                # otherwise the recogniser's device; or an explicit "cuda:1" / "cpu"
     model_name: str = "Qwen/Qwen2.5-1.5B-Instruct"
+    model_revisions: Dict[str, str] = field(default_factory=lambda: {   # pinned Hub commits (reproducibility); a model not listed uses "main"
+        "Qwen/Qwen2.5-1.5B-Instruct": "989aa7980e4cf806f80c7fef2b1adb7bc71aa306"})
+    script_constrained: bool = True            # translation: tokens with letters of a script foreign to the target language are never
+                                               # generated (Qwen code-switched to Chinese on noisy French / English input in the IAM run)
     seq2seq_models: Dict[str, str] = field(default_factory=lambda: {
         "fr": "Helsinki-NLP/opus-mt-en-fr", "es": "Helsinki-NLP/opus-mt-en-es",
         "de": "Helsinki-NLP/opus-mt-en-de", "it": "Helsinki-NLP/opus-mt-en-it",
@@ -509,7 +513,8 @@ class Config:
         c.run.name = f"{c.run_name}_labeled_only"
         c.train.pseudo.enabled = c.train.frag.enabled = False
         c.data.calib_fraction = 0.0
-        return c
+        c.train.unlabeled_aux_ratio = 0.0          # no unlabeled IMAGE either: they fed the consistency / style / masked-code losses, a
+        return c                                   # semi-supervised signal that made the "labeled only" baseline partly semi-supervised
 
     @classmethod
     def make_variant(cls, name: str, base: Optional["Config"] = None) -> "Config":
@@ -521,6 +526,14 @@ class Config:
             return c
         if name == "labeled_only":
             return cls.labeled_only(b)
+        if name == "labeled_only_matched":
+            # the control for the cost of calibration: labeled-only training on EXACTLY the lines `full` trains on (the calibration share of
+            # the label budget is held out and unused).  full - labeled_only_matched = what the unlabeled lines add at equal training labels;
+            # labeled_only_matched - labeled_only = what holding out the calibration lines costs.
+            c = cls.labeled_only(b)
+            c.run.name = c.run.name.replace("_labeled_only", "_labeled_only_matched")
+            c.data.calib_fraction = b.data.calib_fraction
+            return c
         if name == "full_supervised":
             c = copy.deepcopy(b)
             c.run.name = f"{c.run_name}_full_supervised"

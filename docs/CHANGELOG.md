@@ -28,6 +28,11 @@ Fixed (full list with locations in `docs/AUDIT_v10_to_v11.md`)
 * Plan robustness (Kaggle log: every run on GPU 0 aborted with exit code -6 within 20 s): GPU check per GPU, corpus preparation in a CPU-only process, spawn instead of fork for decoding, fault handler in run processes, the end of a failed run's log in the notebook, a stop after repeated failures, `dry_run`.
 * Kaggle (torch 2.11, CUDA 13.0, T4): the leakage probe is fitted on the CPU (no GPU linear-algebra solver in training); worker processes record their error and exit without teardown (a broken CUDA context aborted them before the error was saved); the GPU check covers every operation of a training step.
 * The notebook is independent of the repository: no file or package reference (the build fails otherwise), no test code, no generated data; the line generator and the tiny test configuration (`smoke_config`) moved to the repository tests; `run.self_test` and mode `smoke` were removed from the runtime (tests: `pytest`, `pytest -m slow`).
+* FRAG-RC trust rule vectorised on the device (training and writer self-distillation), identical to the NumPy rule; a crash of the NumPy rule on lines shorter than the guard kernel fixed.
+* LLM pinned and loaded from the local cache; [SCRIPT-LOCK] translation cannot switch script (Qwen produced Chinese for a French target).
+* Figures render Han and Arabic (font fallback, pinned Noto Sans SC when needed, Arabic shaping and right-to-left layout).
+* Baselines: `labeled_only` uses no unlabeled image (it fed the consistency loss before); new `labeled_only_matched` control; 800 runs.
+* Writer self-distillation only in the full evaluation profile; clearer FRAG-RC and calibration log lines.
 * Training curves gained FRAG-RC panels (trusted share, per-cell coverage, realised error of trusted characters).
 * The suite summary reports WER, post-hoc and system CER, a component-contribution table, and can re-aggregate without retraining.
 

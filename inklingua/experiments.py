@@ -48,7 +48,7 @@ from .datasets_registry import DATASETS
 from .schedule import budget, complexity_factor
 from .utils import json_safe
 
-CORE_VARIANTS = ("labeled_only", "ctc_only", "legacy_pl", "full", "full_supervised")
+CORE_VARIANTS = ("labeled_only", "labeled_only_matched", "ctc_only", "legacy_pl", "full", "full_supervised")
 TRAINING_ABLATIONS = ("no_frag", "no_strata", "no_sharpen", "no_mixline", "no_style_task", "no_ses", "no_vq", "no_film", "no_confusion",
                       "no_frame_cons", "no_mask", "no_aux_ctc", "no_v9_reg", "no_hscale")
 DEFAULT_CORPORA = ("iam", "esposalles", "popp", "khatt", "rimes", "himanis", "norhand1", "belfort", "casia", "home_alcar", "norhand3")
@@ -179,14 +179,16 @@ def build_runs(plan: PlanConfig) -> List[Dict[str, Any]]:
 
 
 def apply_profile(cfg: Config, profile: str) -> None:
-    """Evaluation depth.  full: every analysis (translation, interpretability, robustness, report); standard: metrics + every validated
-    post-hoc option incl. writer self-distillation and LLM rescoring (the system CER); core: metrics + the cheap post-hoc options."""
+    """Evaluation depth.  full: every analysis (translation, interpretability, robustness, writer self-distillation, report); standard:
+    metrics + the validated post-hoc options and LLM rescoring (the system CER); core: metrics + the cheap post-hoc options."""
     ic = cfg.infer
     if profile == "full":
         return
     ic.n_vis, ic.n_translate, ic.interpret, ic.robustness_lines, ic.pl_diag_samples, ic.report = 0, 0, False, 0, 0, False
+    ic.wsd = False          # writer self-distillation costs ~8 min per run and was adopted in none of the 6 IAM suite runs: measured in the
+                            # full profile only (first seed of every corpus), where table T4 reports it
     if profile == "core":
-        ic.llm_rescoring, ic.wsd = False, False
+        ic.llm_rescoring = False
 
 
 def run_config(plan: PlanConfig, r: Dict[str, Any], n_parallel: int = 1) -> Config:

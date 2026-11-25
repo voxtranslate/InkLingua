@@ -27,6 +27,58 @@ def write_csv(path: str, header: Sequence[str], rows: Sequence[Sequence[Any]]) -
             w.writerow(["" if (isinstance(v, float) and not np.isfinite(v)) or v is None else v for v in r])
 
 
+# ---------------------------------------------------------------- figures in any script
+CJK_FONT_HINTS = ("Noto Sans CJK", "Noto Serif CJK", "Noto Sans SC", "Source Han Sans", "WenQuanYi", "Droid Sans Fallback", "AR PL")
+CJK_FONT_URL = "https://cdn.jsdelivr.net/gh/notofonts/noto-cjk@Sans2.004/Sans/SubsetOTF/SC/NotoSansSC-Regular.otf"   # pinned release
+CJK_FONT_SHA256 = "faa6c9df652116dde789d351359f3d7e5d2285a2b2a1f04a2d7244df706d5ea9"
+
+
+def configure_figure_fonts(scripts: Sequence[str], cache_dir: Optional[str] = None) -> None:
+    """Glyph fallback for figure text: DejaVu Sans (Latin, Arabic, Hebrew, Cyrillic, Greek) then a font with Han glyphs.  When the data
+    contain a Han corpus and no installed font has Han glyphs, the pinned Noto Sans SC is fetched once (sha256-checked) into cache_dir.
+    Matplotlib's per-glyph "missing from font" warnings are replaced by one log line when a script really has no font."""
+    import hashlib
+    import urllib.request
+    import matplotlib
+    import matplotlib.font_manager as fm
+    warnings.filterwarnings("ignore", message=r"Glyph .* missing from font")
+    names = sorted({f.name for f in fm.fontManager.ttflist})
+    cjk = next((n for h in CJK_FONT_HINTS for n in names if n.startswith(h)), None)
+    if "Han" in scripts and cjk is None and cache_dir:
+        path = os.path.join(cache_dir, "NotoSansSC-Regular.otf")
+        try:
+            if not os.path.exists(path):
+                os.makedirs(cache_dir, exist_ok=True)
+                data = urllib.request.urlopen(CJK_FONT_URL, timeout=120).read()
+                if hashlib.sha256(data).hexdigest() != CJK_FONT_SHA256:
+                    raise RuntimeError("downloaded font has an unexpected sha256")
+                with open(path + ".tmp", "wb") as f:
+                    f.write(data)
+                os.replace(path + ".tmp", path)
+            fm.fontManager.addfont(path)
+            cjk = fm.FontProperties(fname=path).get_name()
+        except Exception as e:
+            LOG.info("no font with Han glyphs (%s): Chinese text in figures is drawn as empty boxes", e)
+    chain = ["DejaVu Sans"] + ([cjk] if cjk else [])
+    matplotlib.rcParams["font.family"] = chain
+    matplotlib.rcParams["font.sans-serif"] = chain + [f for f in matplotlib.rcParams["font.sans-serif"] if f not in chain]
+    matplotlib.rcParams["font.monospace"] = ["DejaVu Sans Mono"] + chain
+
+
+def fig_text(s: str) -> str:
+    """A logical-order string as Matplotlib must receive it: Arabic letters joined (contextual forms) and right-to-left runs laid out
+    visually (Matplotlib does neither).  Other scripts are returned unchanged.  Needs arabic-reshaper + python-bidi; without them the text
+    is returned as it is."""
+    if not s or not any("\u0590" <= ch <= "\u08ff" or "\ufb1d" <= ch <= "\ufefc" for ch in s):
+        return s
+    try:
+        import arabic_reshaper
+        from bidi.algorithm import get_display
+        return "\n".join(get_display(arabic_reshaper.reshape(line)) for line in s.split("\n"))
+    except Exception:
+        return s
+
+
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -91,6 +143,8 @@ def quiet_third_party() -> None:
     os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
     os.environ.setdefault("HF_DATASETS_DISABLE_PROGRESS_BARS", "1")
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")               # no "Loading weights" bars or advisory warnings per run
+    os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
     warnings.filterwarnings("ignore", message=".*unauthenticated requests to the HF Hub.*")
     try:
         from huggingface_hub.utils import disable_progress_bars

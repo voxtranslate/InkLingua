@@ -40,7 +40,8 @@ HEADER = r'''# =================================================================
 #
 #  WHAT RUNS (real data only: the corpora of the registry at pinned Hub commits; no synthetic data, no dummy model)
 #    For every corpus, one after the other (IAM first, then from the smallest corpus to the largest), and for every seed:
-#      core      labeled_only | ctc_only | legacy_pl (line-level pseudo-labels) | full (InkLingua) | full_supervised (100 % labels)
+#      core      labeled_only | labeled_only_matched (same training lines as full) | ctc_only | legacy_pl | full (InkLingua) |
+#                full_supervised (100 % labels)
 #      ablations 14 training ablations of InkLingua
 #      budget    labeled_only and full at 5 % and 10 % labels
 #    Then one model trained on all corpora at once (joint), and the zero-shot adaptation of the IAM model to French and Catalan.
@@ -57,7 +58,7 @@ HEADER = r'''# =================================================================
 #
 #  TO CONTINUE IN THE NEXT SESSION
 #    "Add Input" -> the Output of the previous version of THIS notebook, put its path in RESUME_FROM below, Save & Run All again.
-#    Cost: the full plan is ~2,300 T4 GPU-hours (~100 sessions).  PLAN_OVERRIDES narrows it, e.g. {"seeds": (1337,)} (one third);
+#    Cost: the full plan is ~2,400 T4 GPU-hours (~105 sessions).  PLAN_OVERRIDES narrows it, e.g. {"seeds": (1337,)} (one third);
 #    {"dry_run": True} only checks the GPUs and prepares the first corpus (minutes) -- a good first session.
 #
 #  CONTENTS (one section per component, in reading order)
@@ -97,7 +98,8 @@ def _ensure_packages() -> None:
     if tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2]) < (2, 5):
         raise RuntimeError(f"torch {torch.__version__} is too old (>= 2.5 needed): choose a recent Kaggle environment")
     need = {"editdistance": "editdistance", "pyarrow": "pyarrow", "huggingface_hub": "huggingface_hub", "transformers": "transformers",
-            "accelerate": "accelerate", "datasets": "datasets", "sentencepiece": "sentencepiece"}
+            "accelerate": "accelerate", "datasets": "datasets", "sentencepiece": "sentencepiece",
+            "arabic_reshaper": "arabic-reshaper", "bidi": "python-bidi"}        # Arabic text in figures: joined letters, right-to-left
     missing = [pip for mod, pip in need.items() if importlib.util.find_spec(mod) is None]
     if missing:
         _log(f"installing {missing}")

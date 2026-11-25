@@ -32,7 +32,7 @@ from .datasets_registry import DATASETS
 from .utils import json_safe
 
 NO_WORD_SPACE_SCRIPTS = {"Han"}
-VARIANT_LABEL = {"labeled_only": "labeled only", "ctc_only": "plain CTC", "legacy_pl": "line-level PL (v9)", "full": "InkLingua (full)",
+VARIANT_LABEL = {"labeled_only": "labeled only", "labeled_only_matched": "labeled only (same training lines)", "ctc_only": "plain CTC", "legacy_pl": "line-level PL (v9)", "full": "InkLingua (full)",
                  "full_supervised": "100 % labels"}
 ABLATION_LABEL = {"no_frag": "- FRAG-RC", "no_strata": "- style strata (one global threshold)", "no_sharpen": "- sharpening (plain distillation)",
                   "no_mixline": "- MixLine", "no_style_task": "- style task + FiLM", "no_ses": "- style-equivariant targets", "no_vq": "- VQ bottleneck",
@@ -244,18 +244,24 @@ def build_paper(plan, runs: Sequence[Dict[str, Any]], state: Dict[str, Dict[str,
     t2, claims, sign_deltas = [], [], []
     for c in corpora:
         a = pooled_paired(_pairs(sel(c, "full", main_lf), sel(c, "labeled_only", main_lf)))
+        m = pooled_paired(_pairs(sel(c, "full", main_lf), sel(c, "labeled_only_matched", main_lf)))
         b = pooled_paired(_pairs(sel(c, "full", main_lf), sel(c, "legacy_pl", main_lf)))
-        claims.append((c, a, b))
+        claims.append((c, a, m, b))
         sign_deltas += a.get("per_seed", [])
-    ha, hb = holm([x[1]["p"] for x in claims]), holm([x[2]["p"] for x in claims])
-    for (c, a, b), pa, pb in zip(claims, ha, hb):
-        t2.append([c, str(a["n_seeds"]), _delta_str(a, pa), f"{pa:.3g}" if np.isfinite(pa) and a["n_seeds"] else "-", _delta_str(b, pb),
-                   f"{pb:.3g}" if np.isfinite(pb) and b["n_seeds"] else "-"])
+    ha, hm, hb = (holm([x[k]["p"] for x in claims]) for k in (1, 2, 3))
+
+    def pstr(p_: float, t_: Dict[str, Any]) -> str:
+        return f"{p_:.3g}" if np.isfinite(p_) and t_["n_seeds"] else "-"
+    for (c, a, m, b), pa, pm, pb in zip(claims, ha, hm, hb):
+        t2.append([c, str(a["n_seeds"]), _delta_str(a, pa), pstr(pa, a), _delta_str(m, pm), pstr(pm, m), _delta_str(b, pb), pstr(pb, b)])
     st = sign_test(sign_deltas)
     docs.append(_write_table(out, "T2_main_claim", "Does the unlabeled data help? CER difference (points), InkLingua minus baseline",
-                             ["corpus", "seeds", "Δ vs labeled only", "p (Holm)", "Δ vs line-level PL", "p (Holm)"], t2,
-                             f"Negative = InkLingua is better.  Across all (corpus, seed) pairs: InkLingua better in {st['better']} of {st['n']} "
-                             f"(exact sign test p = {(format(st['p'], '.3g') if st['n'] and np.isfinite(st['p']) else '-')}).  labeled_only also trains on the 10 % of the label budget that InkLingua holds out for calibration."))
+                             ["corpus", "seeds", "Δ vs labeled only", "p (Holm)", "Δ vs labeled only, same training lines", "p (Holm)",
+                              "Δ vs line-level PL", "p (Holm)"], t2,
+                             f"Negative = InkLingua is better.  Across all (corpus, seed) pairs, versus labeled only: InkLingua better in {st['better']} of "
+                             f"{st['n']} (exact sign test p = {(format(st['p'], '.3g') if st['n'] and np.isfinite(st['p']) else '-')}).  'labeled only' trains on the "
+                             "whole label budget, including the 10 % that InkLingua holds out to calibrate its trust rule; 'same training lines' trains on "
+                             "exactly InkLingua's labeled lines, so the two columns separate the effect of the unlabeled lines from the cost of calibration."))
 
     # ---- T3 ablations
     abl_corpora = [c for c in corpora if (not plan.ablation_corpora or c in plan.ablation_corpora)]
@@ -494,7 +500,8 @@ def _write_repro(plan, rows, out) -> None:
           "- validation = val_sel (checkpoint selection, early stopping) + val_gate (every post-hoc decision), disjoint blocks of 20 consecutive lines;",
           "- test: never used for any decision; every evaluation is logged in <run>/protocol/test_looks.jsonl;",
           "- caps keep whole blocks of 20 consecutive lines with a fixed subset seed (identical pools for every variant and seed); test sets are never capped;",
-          "- all variants of a corpus share the same optimisation budget; labeled_only additionally trains on the calibration lines;",
+          "- all variants of a corpus share the same optimisation budget; labeled_only additionally trains on the calibration lines, "
+          "labeled_only_matched does not (the control for the cost of calibration);",
           "- the LLM (external knowledge) only re-ranks the recogniser's own hypotheses and is reported separately (system CER)."]
     with open(os.path.join(out, "REPRODUCIBILITY.md"), "w", encoding="utf-8") as f:
         f.write("\n".join(L) + "\n")

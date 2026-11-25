@@ -49,7 +49,7 @@ from .riskcontrol import auroc, risk_control_threshold
 from .style import NUM_DESC, STYLE_NAMES
 from .text import (align_chars, bootstrap_cer_ci, cer, chrf, detokenize, edit_distance, grapheme_clusters, is_linguistic, paired_bootstrap_delta, paired_mean_ci,
                    ridge_cv_r2, text_baseline_r2)
-from .utils import LOG, json_safe, to_device, torch_load
+from .utils import fig_text, json_safe, LOG, to_device, torch_load
 
 try:
     import warnings as _w
@@ -478,7 +478,8 @@ class Inferencer(PosthocMixin, InterpretMixin):
         if "oracle_translation" in row:
             txt += f"\nplain top-1 : {row['plain_translation']}   (chrF {row['chrf_plain_vs_oracle']:.1f})\noracle(GT)  : {row['oracle_translation']}\n" \
                    f"uncertain   : chrF {row['chrf_uncertain_vs_oracle']:.1f} vs plain-prompt oracle, {row['chrf_uncertain_vs_oracle_same_prompt']:.1f} vs same-prompt oracle"
-        a2.text(0, 1, txt, va="top", ha="left", fontsize=7.5, family="monospace", wrap=True)
+        a2.text(0, 1, fig_text(txt), va="top", ha="left", fontsize=7.5, family=list(plt.rcParams["font.monospace"]), wrap=True)   # an explicit
+        # list: Matplotlib falls back glyph by glyph only along a list of families, not for the generic name "monospace"
         self._fig(f"11_translation/panels/line_{ctx['i']:05d}.png", f"Translation panel - line {ctx['i']} [{row['tag']}]", fig)
 
     # ------------------------------------------------------------------ recognition errors
@@ -833,7 +834,10 @@ class Inferencer(PosthocMixin, InterpretMixin):
                 res["selected_by_rule_at_z"][f"z={z_}"] = {"calibration_lines_kept": int(k_), "coverage_unlabeled": float(s_.mean()),
                                                          "CER_vs_hidden_GT": float(U["ed"][s_].sum() / max(U["reflen"][s_].sum(), 1)) if s_.any() else float("nan")}
         else:
-            LOG.warning("no / too few calibration lines (%d): the learned line reliability could not be evaluated", len(cal))
+            if self.cfg.data.calib_fraction <= 0:            # labeled_only / full_supervised: no calibration split, by design
+                LOG.info("learned line reliability not evaluated: this variant holds out no calibration lines (calib_fraction = 0)")
+            else:
+                LOG.warning("only %d calibration lines: the learned line reliability could not be evaluated", len(cal))
         sat = U["conf"] > 0.95
         res["ctc_confidence_saturation"] = {"share_of_lines_above_0.95": float(sat.mean()),
                                             "CER_of_those_lines": float(U["ed"][sat].sum() / max(U["reflen"][sat].sum(), 1)) if sat.any() else float("nan")}
