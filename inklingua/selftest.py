@@ -768,7 +768,8 @@ def run_self_tests(verbose: bool = True) -> None:
     assert Config.make_variant("no_strata", b_).train.frag.strata == 1 and Config.make_variant("ctc_only", b_).model.film is False
     for kind in Config.ABLATIONS:
         Config.ablation(kind)
-    assert all(v in Config.ABLATIONS or v in ("labeled_only", "full", "full_supervised") for p in SUITE_PRESETS.values() for v in p)
+    assert all(v in Config.ABLATIONS or v in ("labeled_only", "labeled_only_matched", "full", "full_supervised") for p in SUITE_PRESETS.values() for v in p)
+    assert all(len(set(p)) == len(p) and "labeled_only_matched" in p for p in SUITE_PRESETS.values())
     assert Config.from_dict(json.loads(json.dumps(Config().to_dict()))) == Config()
     cm_ = Config.multi(("iam", "khatt"))
     assert Config.from_dict(json.loads(json.dumps(cm_.to_dict()))).data.sources == ("iam", "khatt")
