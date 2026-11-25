@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+inklingua_runs/
+inklingua_smoke/
+*.pt
+.pytest_cache/
