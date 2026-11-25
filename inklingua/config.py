@@ -645,9 +645,12 @@ def dc_from_dict(cls, d: Dict[str, Any]):
 
 SUITE_PRESETS: Dict[str, Tuple[str, ...]] = {
     # the cheapest decisive experiment: does the unlabeled data help at all?
-    "quick": ("labeled_only", "full"),
+    # (labeled_only_matched trains on exactly full's labeled lines: it separates the effect of the unlabeled lines from the cost of the
+    #  calibration lines that full holds out -- without it, full vs labeled_only mixes the two)
+    "quick": ("labeled_only", "labeled_only_matched", "full"),
     # what a reviewer needs: both baselines, the previous method, and each v10/v11 component removed once
-    "paper": ("labeled_only", "ctc_only", "legacy_pl", "no_frag", "no_wsd", "no_mixline", "no_strata", "full"),
-    # everything (expensive)
-    "all": ("labeled_only", "ctc_only", "full_supervised", "legacy_pl") + tuple(k for k in Config.ABLATIONS if k not in ("legacy_pl", "no_pseudo")) + ("full",),
+    "paper": ("labeled_only", "labeled_only_matched", "ctc_only", "legacy_pl", "no_frag", "no_wsd", "no_mixline", "no_strata", "full"),
+    # everything (expensive); every variant once
+    "all": tuple(dict.fromkeys(("labeled_only", "labeled_only_matched", "ctc_only", "full_supervised", "legacy_pl")
+                               + tuple(k for k in Config.ABLATIONS if k not in ("legacy_pl", "no_pseudo")) + ("full",))),
 }
